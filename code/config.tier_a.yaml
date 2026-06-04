@@ -1,0 +1,97 @@
+# 档位 A：基线模型（RGNE 风格）— 用于对照实验 E1，非主结果
+# 用法：python scripts/03_train_tft.py --config config.tier_a.yaml
+# 数据切分与 config.server_c2_72h.yaml 对齐（便于 A/C 对比）
+
+tier: A
+
+paths:
+  data_dir: ../data
+  artifacts_dir: ./artifacts
+
+data:
+  start_date: "20190101"
+  end_date: null
+  news_start: "20200101"
+  max_stocks: 500
+  liquidity_top_k: null
+  min_listing_days: 60
+  min_amount_ma: 5000
+
+smoke_test:
+  enabled: false
+
+tier_a:
+  seq_len: 20
+  gru_hidden: 128
+  mlp_hidden: 256
+  max_stocks: 500
+  start_date: "20190101"
+  news_start: "20190101"
+  seeds: [42]
+  max_epochs: 10
+  patience: 5
+  batch_stocks: 4096   # RTX 3060 6GB；OOM 时改为 2048
+  news_hash_dim: 256
+  news_out_dim: 32
+
+# 评价口径：报告只报 valid；模拟赛 2026-06-01~06-10 为样本外（test_end=null）
+splits:
+  train_end: "20250331"
+  valid_start: "20250401"
+  valid_end: "20260520"
+  test_end: null
+
+features:
+  seq_len: 20
+  winsor_q: 0.01
+
+models:
+  seeds: [42]
+  dropout: 0.2
+  lr: 0.001
+  huber_delta: 1.0
+  use_news_bert: false
+
+ensemble:
+  winsor_q: 0.01
+  modal_weights: null
+  risk_adjust:
+    enabled: true
+    method: sharpe
+    vol_col: vol_20d_raw
+    vol_floor: 0.005
+    risk_aversion: 0.5
+    gamma: 1.0
+
+strategy:
+  n_max: 30
+  q_min: 0.90
+  tau: 0.5
+  w_max: 0.05
+  w_ind_max: 0.25
+  c_min: 0.03
+  delta: 0.01
+  omega_max: 0.25
+  initial_capital: 1000000
+  commission: 0.00015
+  stamp_tax: 0.0005
+  slippage: 0.0005
+
+backtest:
+  benchmark: "000300.SH"
+  lot_size: 100
+  min_commission: 5.0
+  limit_up_pct: 9.5
+  limit_down_pct: -9.5
+  block_limit_up_buy: true
+  block_limit_down_sell: true
+  block_suspended: true
+
+training:
+  device: cuda
+  amp: true
+  tf32: true
+  grad_accum_steps: 1
+  compile: false
+  panel_n_jobs: 4
+  news_n_jobs: 4

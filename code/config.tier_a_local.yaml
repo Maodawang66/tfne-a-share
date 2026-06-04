@@ -1,0 +1,112 @@
+# 档位 A 本机基线（RGNE：GRU + MLP + 新闻哈希）
+# 硬件目标：RTX 3060 Laptop 6GB + 4 CPU 核 + conda ai25
+# 粗估全流程 3–6h（Top500 + 2019–2026 数据）；无需 requirements-nlp.txt（无 BERT）
+#
+# 一键：python scripts/run_tier_a_local.py
+# 产物：artifacts/checkpoints/tier_a/、predictions/tier_a/、metrics/tier_a/
+#       metrics/tier_a/ic_summary.json（含 strategy_topk / hit_rate_topk 等）
+#       metrics/tier_a/strategy_topk.json（策略 Top-K 专表，K=n_max=30）
+#
+# 数据切分已与 TFNE-C2（config.server_c2_72h.yaml）对齐，便于与档位 C 对比：
+#   train ≤ 2025-03-31 | valid 2025-04-01–2026-05-20 | test_end=null（报告只报 valid）
+#   FDL2026 模拟赛 2026-06-01~06-10 为样本外，不参与 IC/回测指标
+#
+# 注意：prep 会重写 artifacts/panel_daily.parquet（与档位 C 共用路径），
+#       重跑会覆盖 tier_a 下全部 checkpoint / 预测 / 回测产物。
+
+tier: A
+
+paths:
+  data_dir: ../data
+  artifacts_dir: ./artifacts
+
+data:
+  start_date: "20190101"
+  end_date: null
+  news_start: "20190101"
+  max_stocks: 500
+  min_listing_days: 60
+  min_amount_ma: 5000
+
+smoke_test:
+  enabled: false
+
+tier_a:
+  seq_len: 20
+  gru_hidden: 128
+  mlp_hidden: 256
+  max_stocks: 500
+  start_date: "20190101"
+  news_start: "20190101"
+  seeds: [42]
+  max_epochs: 10
+  patience: 5
+  batch_stocks: 4096       # GRU/MLP 轻量；6GB OOM 时改为 2048
+  news_hash_dim: 256
+  news_out_dim: 32
+
+# 与 C2 一致：报告只引用 valid；模拟赛为样本外
+splits:
+  train_end: "20250331"
+  valid_start: "20250401"
+  valid_end: "20260520"
+  test_end: null
+
+features:
+  seq_len: 20
+  winsor_q: 0.01
+
+models:
+  seeds: [42]
+  dropout: 0.2
+  lr: 0.001
+  huber_delta: 1.0
+  use_news_bert: false
+
+ensemble:
+  winsor_q: 0.01
+  modal_weights: null
+  # 风险调整打分：NN 预测 μ̂，σ 用 vol_20d_raw；04 融合后生效，无需重训
+  risk_adjust:
+    enabled: true
+    method: sharpe              # sharpe | certainty_equivalent | rank_penalty
+    vol_col: vol_20d_raw
+    vol_floor: 0.005            # 日波动下限 0.5%，防除零
+    risk_aversion: 0.5          # rank_penalty 用
+    gamma: 1.0                  # certainty_equivalent: μ - γσ²
+
+strategy:
+  n_max: 30
+  q_min: 0.90
+  tau: 0.5
+  w_max: 0.05
+  w_ind_max: 0.25
+  c_min: 0.03
+  gamma_vol: 0.05
+  delta: 0.01
+  omega_max: 0.25
+  initial_capital: 1000000
+  commission: 0.00015
+  stamp_tax: 0.0005
+  slippage: 0.0005
+
+backtest:
+  benchmark: "000300.SH"
+  lot_size: 100
+  min_commission: 5.0          # 单笔最低佣金（元）
+  limit_up_pct: 9.5            # 涨停不买（执行日 pct_chg）
+  limit_down_pct: -9.5         # 跌停不卖
+  block_limit_up_buy: true
+  block_limit_down_sell: true    # 新增：跌停日跳过卖出
+  block_suspended: true          # 执行日 vol=0 不买卖
+
+training:
+  device: cuda
+  amp: true
+  tf32: true
+  grad_accum_steps: 1
+  grad_clip: 1.0
+  compile: false
+  panel_n_jobs: 4
+  news_n_jobs: 4
+  dataloader_num_workers: 0

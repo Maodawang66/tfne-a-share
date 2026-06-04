@@ -1,0 +1,148 @@
+# TFNE-C2 · 第二代档位 C（基于 job 7707 实测反推的 72h 满预算方案）
+#
+# 代号：TFNE-C2（artifacts_tag=tier_c2，不覆盖 tier_c / job 7707 产物）
+#
+# 7707 实测基线（5090、Top2000、1 seed、8 epoch）：
+#   TFT 1.35h + FTT 1.74h + News 0.15h + eval ≈3.2h GPU
+# C2 预算（Top3000、3 seed、18 epoch）：粗算 28–42 h 典型，极端 ~58 h（<72 h）
+#
+# 用法：
+#   python scripts/run_server_c2_72h.py prep
+#   python scripts/run_server_c2_72h.py train
+#   python scripts/run_server_c2_72h.py eval
+# 策略 Top-K 指标：metrics/tier_c2/strategy_topk.json（K=n_max=10，05 自动生成）
+# 文档：../设想.md
+
+tier: C
+artifacts_tag: tier_c2
+
+paths:
+  data_dir: ../data
+  artifacts_dir: ./artifacts
+
+data:
+  start_date: "20190101"
+  end_date: null
+  news_start: "20190101"
+  max_stocks: null
+  liquidity_top_k: 3000              # 满血股票池（7707 为 2000）
+  min_listing_days: 60
+  min_amount_ma: 5000
+
+smoke_test:
+  enabled: false
+
+# 评价口径（情况 A）：报告只引用 valid；不设 test 回测段。
+# valid 止于 2026-05-20（模拟赛前）；FDL2026 模拟赛 2026-06-01~06-10 为样本外，仅 07 出单。
+splits:
+  train_end: "20250331"
+  valid_start: "20250401"
+  valid_end: "20260520"
+  test_end: null
+
+features:
+  seq_len: 60
+  winsor_q: 0.01
+
+models:
+  seeds: [42, 123, 456]            # 三 seed 秩融合（7707 仅 1 seed）
+  hidden_size: 128
+  dropout: 0.2
+  batch_stocks: 4096
+  lr: 0.0003
+  max_epochs: 18                   # 7707 为 8；按 7707 单 epoch 耗时外推仍 <72h
+  patience: 6
+  huber_delta: 1.0
+  use_news_bert: true
+  news_max_length: 128
+  news_max_epochs: 4
+  news_patience: 2
+  news_batch_size: 64
+  news_predict_batch_size: 256
+  news_train_max_samples: 80000    # 7707 为 40000
+  news_lr: 0.0002
+  lora_r: 8
+  lora_alpha: 16
+  ftt_n_blocks: 4
+  ftt_d_token: 128
+
+ensemble:
+  winsor_q: 0.01
+  modal_weights: null
+  predict_news_from_checkpoint: true   # 04 融合时自动用 checkpoint 补全/刷新 News 预测
+  risk_adjust:
+    enabled: true
+    method: sharpe
+    vol_col: vol_20d_raw
+    vol_floor: 0.005
+    risk_aversion: 0.5
+    gamma: 1.0
+
+strategy:
+  n_max: 10
+  q_min: 0.90
+  tau: 0.5
+  w_max: 0.05
+  w_ind_max: 0.25
+  c_min: 0.03
+  gamma_vol: 0.05
+  delta: 0.01
+  omega_max: 0.25
+  initial_capital: 1000000
+  commission: 0.00015
+  stamp_tax: 0.0005
+  slippage: 0.0005
+
+backtest:
+  benchmark: "000300.SH"
+  lot_size: 100
+  min_commission: 5.0
+  limit_up_pct: 9.5
+  limit_down_pct: -9.5
+  block_limit_up_buy: true
+  block_limit_down_sell: true
+  block_suspended: true
+
+training:
+  device: cuda
+  amp: false                         # 7707 教训：Top 全量 TFT 开 AMP 易 loss=nan
+  tf32: false
+  grad_accum_steps: 1
+  grad_clip: 1.0
+  compile: false
+  panel_n_jobs: 16
+  news_n_jobs: 16
+  dataloader_num_workers: 0
+
+report_notes:
+  profile: tfne_c2_72h_balanced
+  generation: 2
+  baseline_job: train_7707
+  hardware_measured: "NVIDIA RTX 5090 31.4GB, conda ai25"
+  measured_baseline_gpu_hours:
+    total: 3.24
+    tft: 1.35
+    ftt: 1.74
+    news: 0.15
+    top_k: 2000
+    seeds: 1
+    max_epochs: 8
+  estimated_gpu_hours: "28–42 typical, ~58 worst"
+  scaling_assumptions:
+    - "Top3000 vs 2000 行数比 ≈1.45 → 单 epoch 耗时 ×1.45"
+    - "TFT 7707: 1.35h/5ep ≈16.2 min/ep@2000 → ~23.5 min/ep@3000"
+    - "FTT 7707: 1.74h/8ep ≈13.1 min/ep@2000 → ~19.0 min/ep@3000"
+    - "News 7707: 0.15h@40k → ~0.35h@80k/seed"
+    - "3 seeds × (TFT~10ep + FTT~12ep早停) + eval~3h"
+  improvements_vs_7707:
+    - "Top2000 → Top3000"
+    - "1 seed → 3 seeds"
+    - "max_epochs 8 → 18, patience 3 → 6"
+    - "News 训练 4万 → 8万"
+    - "train_end 20240630 → 20250331（含 2025Q1）"
+    - "valid 改为 20250401–20260520（赛前 holdout 定权）"
+    - "04 自动 News checkpoint 推理（增量 predict 可用）"
+  sacrifices_vs_full_server_c:
+    - "news_max_length 仍为 128（非 256）"
+    - "max_epochs 18 非 30（靠 patience 早停）"
+    - "amp/tf32 关闭（数值稳定优先）"

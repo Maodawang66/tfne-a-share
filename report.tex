@@ -1,0 +1,1673 @@
+% !TEX program = xelatex
+% 编译：xelatex report.tex（建议编译两次以更新目录）
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=green!50!black,urlcolor=blue!70!black}
+\graphicspath{{tier_c2_project/figures/}}
+
+\title{\textbf{深度学习基础大作业实验报告}\\[0.4em]
+\large A 股趋势预测与模拟交易——档位 C Transformer 架构（TFNE-C）}
+\author{
+  【组员1姓名】（【学号1】）\quad
+  【组员2姓名】（【学号2】）\quad
+  【组员3姓名】（【学号3】）
+}
+\date{2026 年 5 月}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{center}
+\fbox{\parbox{0.92\textwidth}{
+\textbf{方案代号}：TFNE-C（TFT-lite + FT-Transformer + NewsLoRA，三 seed 秩融合）\\
+\textbf{配置}：\texttt{config.server\_c2\_72h.yaml}（Top3000 / 3 seeds / 72h GPU 预算）\\
+\textbf{基线对照}：档位 A RGNE-Lite（见 \texttt{基线报告.tex}）\\
+\textbf{代码路径}：\texttt{code/}；入口 \texttt{scripts/run\_server\_c2\_72h.py}\\
+\textbf{硬件}：USTC 算力平台 NVIDIA RTX 5090（31.4\,GB）；conda \texttt{ai25}\\
+\textbf{作业编号}：train\_7945；完成时间 2026-05-24 15:04（UTC+8）\\
+\textbf{随机种子}：42, 123, 456
+}}
+\end{center}
+
+\begin{abstract}
+本实验在档位 A 基线（RGNE-Lite：GRU + TabMLP + NewsHash）同一套数据与策略框架上，将三个子模型升级为\textbf{深度学习 Transformer 族}：时序分支采用 \textbf{TFT-lite}（双层 LSTM + 时序注意力 + 静态变量嵌入），截面分支采用 \textbf{FT-Transformer}（特征 Token 化 + 4 层自注意力），新闻分支采用 \textbf{Chinese-RoBERTa + LoRA} 微调。三模态各训练 3 个随机种子，经 Spearman ICIR 定权秩融合得到统一 alpha，再映射为目标权重组合并完成 T+1 历史回测。
+
+服务器实验采用流动性 \textbf{Top 3000}、序列窗口 \textbf{60 日}、2019-01 至 2026-05 样本。训练截止 \textbf{2025-03-31}（含 2025Q1）；验证集为 \textbf{2025-04-01 至 2026-05-20} 的赛前 holdout（273 个交易日），\textbf{全部 IC 与回测指标均在此验证集上报告}；FDL2026 模拟赛（2026-06-01 至 06-10）视为样本外，不参与历史指标。融合后在验证集全市场 mean IC 为 \textbf{0.077}、ICIR 为 \textbf{0.794}；历史回测总收益 \textbf{43.5\%}、复利年化 CAGR \textbf{39.6\%}、夏普 \textbf{1.28}、最大回撤 \textbf{-27.5\%}（期末净值 143.5 万元）。同口径档位 A 基线（Top500、同验证窗）mean IC \textbf{0.016}、Sharpe \textbf{1.53}、总收益 \textbf{32.2\%}；本方案排序指标（IC/ICIR）显著提升；组合层指标因股票池规模与策略参数（\texttt{n\_max=30} vs 50）不同，\textbf{不宜仅凭 Sharpe 高低判定优劣}。
+
+\vspace{0.5em}
+\noindent\textbf{关键词：}Transformer；TFT；FT-Transformer；LoRA；多模态融合；IC/ICIR；历史回测
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{任务背景与方案定位}
+%==============================================================================
+
+\subsection{作业背景与问题形式化}
+
+与档位 A 相同，任务为\textbf{日频横截面排序}：每个交易日 $t$ 对股票池内个股 $i$ 构造特征 $X_{i,t}$，预测下一日相对沪深 300 的超额收益
+\begin{equation}
+  y_{i,t} = r_{i,t+1} - r^{\mathrm{mkt}}_{t+1},
+\end{equation}
+模型输出分数 $s_{i,t}$，主评价指标为 Spearman \textbf{IC}。策略仅在头部 quantile 选股，因此除全市场 IC 外，还报告 Top 10\% 内 IC 与多空 spread（定义同档位 A 基线报告）。
+
+\subsection{档位 A 基线 vs 档位 C 本实验}
+
+档位 A（RGNE-Lite）在本机 RTX 3060 6GB 上完成，采用 Top 500 股票池、$L=20$ 日窗口、GRU/MLP/NewsHash 三模态；与档位 C \textbf{共用同一验证窗}（2025-04-01 至 2026-05-20，273 日），验证集 mean IC \textbf{0.016}、Sharpe \textbf{1.53}、总收益 \textbf{32.2\%}。本实验（TFNE-C）在 USTC 5090 服务器上扩展规模与模型复杂度，核心对比如表~\ref{tab:vs-a}。
+
+\begin{table}[H]
+\centering
+\caption{档位 A 基线（RGNE-Lite）vs 档位 C 本实验（TFNE-C）}
+\label{tab:vs-a}
+\begin{tabular}{lll}
+\toprule
+\textbf{维度} & \textbf{档位 A（基线）} & \textbf{档位 C（本实验）} \\
+\midrule
+方案代号   & RGNE-Lite              & TFNE-C \\
+时序模型   & GRU，$L=20$            & TFT-lite（LSTM+Attn），$L=60$ \\
+截面模型   & TabMLP                 & FT-Transformer（4 blocks） \\
+新闻模型   & HashingVectorizer      & RoBERTa-wwm-ext + LoRA \\
+股票池     & Top 500（本机）        & Top 3000（服务器） \\
+随机种子   & 42（1 seed）           & 42, 123, 456（3 seeds） \\
+训练截止   & 2025-03-31             & 2025-03-31 \\
+验证区间   & 2025-04-01 --- 2026-05-20 & 2025-04-01 --- 2026-05-20 \\
+验证 IC 天数 & 274                  & 273 \\
+数据截止   & 2026-05-20             & 2026-05-20 \\
+样本外     & \multicolumn{2}{c}{FDL2026 模拟赛 2026-06-01 --- 06-10（不出现在 IC/回测表）} \\
+硬件       & RTX 3060 6GB           & RTX 5090 31.4GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{对比说明：} 两档实验已对齐验证时段与训练截止，便于公平对照；股票池（Top500 vs Top3000）与持仓上限（A：\texttt{n\_max=30}；C：\texttt{n\_max=50}）仍不同，表~\ref{tab:vs-a} 主要用于说明\textbf{方法升级路径}；第~\ref{sec:results} 节给出同口径 valid 数值对照。
+
+\subsection{本实验配置说明}
+
+配置文件 \texttt{config.server\_c2\_72h.yaml} 核心设定：
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{artifacts\_tag}: \texttt{tier\_c2}；
+  \item \texttt{liquidity\_top\_k}: 3000；
+  \item \texttt{seeds}: [42, 123, 456]，各模态独立训练后以 seed 内均值参与融合；
+  \item TFT/FTT \texttt{max\_epochs}: 18，\texttt{patience}: 6；
+  \item News：8 万子采样、4 epoch；\texttt{predict\_news\_from\_checkpoint=true}（增量 predict 可用）；
+  \item \texttt{amp=false}, \texttt{tf32=false}（Top 全量 TFT 数值稳定优先）。
+\end{itemize}
+
+\textbf{评价口径（情况 A）：} 配置 \texttt{test\_end=null}，\textbf{不设独立 test 段}；05/06 脚本仅在 \texttt{valid} 上输出 IC 与回测，报告正文\textbf{只引用 valid 数字}。FDL2026 模拟赛（2026-06-01 至 06-10）视为真实样本外，仅通过 \texttt{07\_predict\_latest} 生成调仓单，\textbf{不参与}历史 IC/回测表格。
+
+\subsection{产物完整性说明}
+
+本地 \texttt{code/artifacts/tier\_c2/} 已包含评估闭环产物：
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{metrics/tier\_c2/ic\_summary.json} — IC/ICIR/spread；
+  \item \texttt{backtest/tier\_c2/valid/} — 净值与回测指标；
+  \item \texttt{predictions/tier\_c2/fusion\_weights.json}、\texttt{ensemble\_scores.parquet}；
+  \item \texttt{orders/tier\_c2/orders\_20260520.csv} — 最新调仓；
+  \item \texttt{features/feature\_meta.json} — 特征列定义；
+  \item \texttt{checkpoints/tier\_c2/\{tft,ftt,news\}/seed\_*/best.pt} — 9 个 checkpoint（News 约 410\,MB/个）。
+\end{itemize}
+
+\paragraph{章节安排。} 第~\ref{sec:metrics} 节先给出全部评价指标定义与 A/C2 验证集对照表；第~\ref{sec:results} 节再展开实验结果分析。
+
+%==============================================================================
+\section{评价指标定义与计算公式}
+\label{sec:metrics}
+%==============================================================================
+
+本节置于全文前部（紧接任务背景），先统一符号、公式与 A/C2 对照口径；后续数据处理、模型、策略与实验结果中的数字均引用本节。IC@K 等策略对齐指标中的 $K$=\texttt{n\_max}、$Q_{0.90}$ 含义见第~\ref{sec:strategy} 节。验证集汇总见表~\ref{tab:metrics-ac-c2}；数值机理详析见第~\ref{sec:results} 节。
+
+\subsection{标签与符号约定}
+
+\begin{itemize}[leftmargin=2em]
+  \item $s_{i,t}$：股票 $i$ 在交易日 $t$ 收盘后得到的融合 score（模型输出）；
+  \item $y_{i,t}=r_{i,t+1}-r^{\mathrm{mkt}}_{t+1}$：下一日相对沪深 300 的\textbf{超额收益}（标签）；
+  \item $\mathcal U_t$：第 $t$ 日有效样本集合（代码要求 $|\mathcal U_t|\ge 30$）；
+  \item $P_t$：组合日频净值（初始 $P_0=10^6$ 元）；
+  \item $r_t = P_t/P_{t-1}-1$：组合日收益率；
+  \item $n$：有效交易日数（本实验验证集 $n=273$）。
+\end{itemize}
+
+\subsection{预测能力指标}
+
+\subsubsection{日度 IC（Information Coefficient）}
+
+\textbf{定义：} 在每个交易日 $t$ 的横截面上，衡量模型分数 $s_{i,t}$ 与次日超额收益 $y_{i,t}$ 的\textbf{秩相关}强度。本实验采用 \textbf{Spearman 相关系数}（对极端值更稳健）。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{IC}_t
+  = \mathrm{Spearman}\big(\{s_{i,t}\}_{i\in\mathcal U_t},\ \{y_{i,t}\}_{i\in\mathcal U_t}\big)
+  = \mathrm{Corr}\big(\mathrm{rank}(s_{i,t}),\ \mathrm{rank}(y_{i,t})\big).
+\end{equation}
+
+\textbf{现实意义：} IC 回答「今天分高的股票，明天是否更可能跑赢大盘」。$\mathrm{IC}_t=0$ 表示排序与收益无关；$\mathrm{IC}_t=0.07$ 表示弱正相关——在日频 A 股中 \textbf{0.02--0.08 已属可用区间}，不必期待 IC 接近 1。IC 是评价「排序模型」最核心的指标，与按 score 调仓的策略目标直接一致。
+
+\subsubsection{平均 IC（mean IC）}
+
+\textbf{定义：} 对样本期内全部有效交易日的 IC 序列取算术平均。
+
+\textbf{公式：}
+\begin{equation}
+  \overline{\mathrm{IC}} = \frac{1}{D}\sum_{t=1}^{D}\mathrm{IC}_t,
+\end{equation}
+其中 $D$ 为 IC 有效天数（本实验验证集 $D=273$）。
+
+\textbf{现实意义：} 反映模型在一段时期内\textbf{平均排序能力}。本实验验证集 $\overline{\mathrm{IC}}=0.077$，约为同口径档位 A 基线（0.016）的 \textbf{4.8 倍}，说明 Transformer 升级显著改善了横截面 alpha 水平。
+
+\subsubsection{IC 标准差（std IC）}
+
+\textbf{定义：} IC 日序列的样本标准差（\texttt{ddof=1}）。
+
+\textbf{公式：}
+\begin{equation}
+  \sigma_{\mathrm{IC}} = \sqrt{\frac{1}{D-1}\sum_{t=1}^{D}(\mathrm{IC}_t-\overline{\mathrm{IC}})^2}.
+\end{equation}
+
+\textbf{现实意义：} 衡量 IC 的\textbf{日际波动}。$\sigma_{\mathrm{IC}}$ 越大，说明模型在某些交易日几乎失效、某些日又很强。本实验验证集 $\sigma_{\mathrm{IC}}=0.097$，低于档位 A 的 0.153，排序信号相对更稳。
+
+\subsubsection{ICIR（IC Information Ratio）}
+
+\textbf{定义：} IC 均值与 IC 标准差之比，又称「IC 的信息比率」。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{ICIR} = \frac{\overline{\mathrm{IC}}}{\sigma_{\mathrm{IC}}}.
+\end{equation}
+
+\textbf{现实意义：} 类似「IC 的夏普比率」——不仅要求 IC 为正，还要求 IC \textbf{稳定}。ICIR$=0.79$ 意味着平均 IC 约为日际波动的 0.8 倍；ICIR 越高，融合权重定权时该模态越可信。本实验验证集 ICIR$=0.794$，显著高于档位 A 的 0.102。
+
+\subsubsection{Top 10\% 内 IC（top quantile IC）}
+
+\textbf{定义：} 仅在当日 score 位于最高 10\% 分位（$\ge Q_{0.90}$）的股票子集上，重复计算 Spearman IC——与策略 \texttt{q\_min=0.90} 对齐。
+
+\textbf{公式：} 记 $\mathcal H_t=\{i\in\mathcal U_t \mid s_{i,t}\ge Q_{0.90}(s_{\cdot,t})\}$，
+\begin{equation}
+  \mathrm{IC}_t^{\mathrm{top}}
+  = \mathrm{Spearman}\big(\{s_{i,t}\}_{i\in\mathcal H_t},\ \{y_{i,t}\}_{i\in\mathcal H_t}\big),
+  \qquad
+  \overline{\mathrm{IC}}^{\mathrm{top}} = \frac{1}{D}\sum_t \mathrm{IC}_t^{\mathrm{top}}.
+\end{equation}
+
+\textbf{现实意义：} 回答「在已经筛出的头部候选里，能否再精细排序」。本实验验证集 $\overline{\mathrm{IC}}^{\mathrm{top}}=0.014$；档位 A 同窗为 \textbf{0.013}。二者均偏低，策略更依赖头尾 spread 与 Top-$K$ 内 spread，而非整个 10\% 分位内的精细排序。
+
+\subsubsection{多空 spread（Long--Short Spread）}
+
+\textbf{定义：} 每个交易日，score 最高 10\% 股票组的平均超额收益，减去 score 最低 10\% 组的平均超额收益（\textbf{未扣费、非真实对冲组合}）。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{spread}_t
+  = \underbrace{\frac{1}{|\mathcal T_t|}\sum_{i\in\mathcal T_t} y_{i,t}}_{\text{top 10\% 平均超额}}
+  - \underbrace{\frac{1}{|\mathcal B_t|}\sum_{i\in\mathcal B_t} y_{i,t}}_{\text{bottom 10\% 平均超额}},
+\end{equation}
+\begin{equation}
+  \overline{\mathrm{spread}} = \frac{1}{D}\sum_{t=1}^{D}\mathrm{spread}_t,
+  \qquad
+  \text{年化 spread} = \overline{\mathrm{spread}}\times 252.
+\end{equation}
+
+\textbf{现实意义：} 直接度量「高分组是否跑赢低分组」，比全市场 IC 更贴近「只买头部」的策略逻辑。本实验验证集日均 spread$=0.314\%$，年化约 79.0\%——这是\textbf{理论分组收益上限参考}，实际只做多组合会因成本、仓位约束、换手上限而低于该值。档位 A 同窗 long--short spread 为 \textbf{$-0.116\%$/日}（头尾分组在该窗口内略偏负），与其窄池、标签噪声有关，但经策略层约束后回测仍可盈利（见表~\ref{tab:metrics-ac-c2}）。
+
+\subsubsection{策略 Top-$K$ IC（IC@K，\texttt{strategy\_topk}）}
+
+\textbf{定义：} 仅在策略\textbf{真实候选池}内计算 Spearman IC：先取 score $\ge Q_{0.90}$，再取 Top $K$（$K=\texttt{n\_max}$，A 为 30，C2 为 50），在该 $K$ 只子集上算 $\mathrm{IC}_t$ 并平均。
+
+\textbf{公式：} 记 $\mathcal S_t=\mathrm{Top}K\big(\{i: s_{i,t}\ge Q_{0.90}\}\big)$，
+\begin{equation}
+  \mathrm{IC@K}_t = \mathrm{Spearman}\big(\{s_{i,t}\}_{i\in\mathcal S_t},\ \{y_{i,t}\}_{i\in\mathcal S_t}\big),
+  \qquad
+  \overline{\mathrm{IC@K}} = \frac{1}{D}\sum_t \mathrm{IC@K}_t.
+\end{equation}
+
+\textbf{现实意义：} 比「全市场 IC」和「整个 Top 10\% IC」\textbf{更贴近} \texttt{target\_weights} 的买入范围——回答「即将持有的 $K$ 只里，能否再排好序」。验证集：A 的 $\overline{\mathrm{IC@K}}=\textbf{0.0303}$（$K$=30，274 日），C2 为 $\textbf{-0.0037}$（$K$=50，273 日）。\textbf{ paradox：} C2 全市场 IC 远高于 A，但 IC@K 反而略负，说明 Transformer 的 alpha 主要体现在「进 Top 池」而非「池内精细排序」；A 窄池 + 小 $K$ 使 IC@K 更易为正。
+
+\subsubsection{Top-$K$ 命中率（\texttt{hit\_rate\_topk}）}
+
+\textbf{定义：} 每个交易日，在策略 Top-$K$ 候选池内，次日超额收益 $y_{i,t}>0$ 的股票占比，再对日序列取平均。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{HR}_t = \frac{1}{|\mathcal S_t|}\sum_{i\in\mathcal S_t}\mathbf 1[y_{i,t}>0],
+  \qquad
+  \overline{\mathrm{HR}} = \frac{1}{D}\sum_t \mathrm{HR}_t.
+\end{equation}
+
+\textbf{现实意义：} 衡量「买入组合里有多少比例跑赢大盘」——不区分幅度，只看方向。验证集 A 为 \textbf{47.0\%}，C2 为 \textbf{50.1\%}，均接近随机（50\%），说明单日方向预测仍难；组合收益更多来自\textbf{权重倾斜}与\textbf{多日累积}，而非「每天都多数上涨」。
+
+\subsubsection{Top-$K$ 内部分 spread（\texttt{within\_topk\_spread}）}
+
+\textbf{定义：} 在 Top-$K$ 候选池内，按 score 排序后将池子\textbf{对半分}，比较前半（更高分）与后半的平均超额收益之差。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{ws}_t = \overline{y}_{\mathcal S_t^{\mathrm{hi}}} - \overline{y}_{\mathcal S_t^{\mathrm{lo}}},
+  \qquad
+  \overline{\mathrm{ws}} = \frac{1}{D}\sum_t \mathrm{ws}_t.
+\end{equation}
+
+\textbf{现实意义：} 直接对应「持仓内部：高分票是否比低分票赚更多」。验证集 A 年化 \textbf{10.2\%}，C2 年化 \textbf{21.8\%}（由 \texttt{print\_strategy\_topk\_metrics.py} 读取 \texttt{strategy\_topk.json}）——C2 在策略尺度上的内部分化优于 A，与 IC@K 的负值并存（IC 看秩相关，spread 看均值差）。
+
+\subsubsection{信号层组合收益（\texttt{signal\_portfolio}，无交易成本）}
+
+\textbf{定义：} 每个交易日对全截面 score 调用 \texttt{target\_weights} 得到权重 $w_{i,t}$，计算\textbf{理论}次日组合超额 $\sum_i w_{i,t}\, y_{i,t}$，再年化；\textbf{不含}佣金、滑点、涨跌停与换手上限。
+
+\textbf{现实意义：} 衡量「若每日按目标权重完美成交，信号本身能解释多少超额」——是回测的上界参考，\textbf{不能}替代 \texttt{06\_backtest.py}。验证集（\texttt{strategy\_topk.json}）：A 年化 \textbf{$-14.2\%$}，C2 年化 \textbf{+34.1\%}；而同窗扣费回测 A 为 \textbf{+32.2\%}、C2 为 \textbf{+43.5\%}。A 的 signal 与回测严重背离，说明档位 A 启用了 \texttt{risk\_adjust} 改变 score、且信号层未建模 T+1/成本/软换仓——读数时\textbf{必须以回测为准}，signal\_portfolio 仅作诊断。
+
+\subsubsection{相对沪深 300 指标（\texttt{compute\_relative\_metrics}）}
+
+\textbf{定义：} 将组合日收益 $r_t$ 与基准（000300.SH）日收益 $r_t^b$ 对齐，报告超额与回归指标。
+
+\textbf{公式（节选）：}
+\begin{equation}
+  R_{\mathrm{exc,tot}} = \frac{P_T}{P_0} - \frac{B_T}{B_0},
+  \qquad
+  \mathrm{IR} = \frac{(\bar r-\bar r_b)\times 252}{\mathrm{std}(r_t-r_t^b)\sqrt{252}},
+\end{equation}
+\begin{equation}
+  r_t = \alpha + \beta r_t^b + \varepsilon_t
+  \quad\Rightarrow\quad
+  \alpha_{\mathrm{ann}} = \hat\alpha \times 252.
+\end{equation}
+
+\textbf{现实意义：} 回答「策略是否真跑赢大盘，而非仅随 beta 波动」。验证集同窗：沪深300 总收益 \textbf{24.8\%}；A 超额总收益 \textbf{5.9\%}、IR \textbf{0.67}、$\alpha_{\mathrm{ann}}$ \textbf{5.4\%}；C2 超额总收益 \textbf{15.0\%}、IR \textbf{0.74}、$\alpha_{\mathrm{ann}}$ \textbf{9.0\%}、$\beta=\textbf{1.33}$（C2 市场暴露更高，解释其 MDD 更深）。
+
+\subsubsection{融合权重 ICIR（模态定权，补充）}
+
+\textbf{定义：} 对模态 $m\in\{A,B,C\}$ 分别计算验证集 IC 序列的 ICIR，再对非负 ICIR 归一化得到融合权重 $w_m$。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{ICIR}_m = \frac{\overline{\mathrm{IC}}_m}{\sigma_{\mathrm{IC}_m}},
+  \qquad
+  w_m = \frac{\max(\mathrm{ICIR}_m,0)}{\sum_k \max(\mathrm{ICIR}_k,0)}.
+\end{equation}
+
+\textbf{现实意义：} 自动降低弱模态（如档位 A 的 NewsHash）权重、提高强模态权重。本实验 $w_A=35.3\%$, $w_B=38.1\%$, $w_C=26.6\%$，三模态均衡参与融合。
+
+\subsection{组合回测指标}
+
+设验证集净值序列为 $\{P_t\}_{t=0}^{n}$，日收益 $r_t=P_t/P_{t-1}-1$。
+
+\subsubsection{总收益率（Total Return）}
+
+\textbf{定义：} 回测区间内，期末净值相对期初净值的增长比例。
+
+\textbf{公式：}
+\begin{equation}
+  R_{\mathrm{tot}} = \frac{P_T}{P_0} - 1.
+\end{equation}
+
+\textbf{现实意义：} 区间\textbf{实际}盈亏，最直观。本实验验证集 $R_{\mathrm{tot}}=\textbf{43.5\%}$（100 万 $\to$ 143.5 万），273 个交易日；档位 A 同窗 $R_{\mathrm{tot}}=\textbf{32.2\%}$。
+
+\subsubsection{复利年化收益率（CAGR）}
+
+\textbf{定义：} 假设按相同复利速度持续一整年，由区间总收益外推得到的年化率。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{CAGR} = \left(\frac{P_T}{P_0}\right)^{252/n} - 1.
+\end{equation}
+
+\textbf{现实意义：} 便于跨不同长度区间比较，但\textbf{短样本会放大 headline 数字}。本实验 $\mathrm{CAGR}=\textbf{39.6\%}$（273 日）；档位 A 同窗 $\mathrm{CAGR}=\textbf{29.4\%}$。
+
+\subsubsection{算术年化收益率（Annualized Arithmetic Return）}
+
+\textbf{定义：} 日收益算术均值乘以 252。
+
+\textbf{公式：}
+\begin{equation}
+  \mu_{\mathrm{ann}} = \bar{r}\times 252,
+  \qquad \bar{r}=\frac{1}{n}\sum_{t=1}^{n}r_t.
+\end{equation}
+
+\textbf{现实意义：} 夏普比率的\textbf{分子}，反映「典型一天收益放大到一年」的水平。本实验 $\mu_{\mathrm{ann}}=37.8\%$，与 CAGR 39.6\% 接近（273 日样本较长，两者差异小于短样本情形）。
+
+\subsubsection{年化波动率（Annualized Volatility）}
+
+\textbf{定义：} 日收益标准差年化。
+
+\textbf{公式：}
+\begin{equation}
+  \sigma_{\mathrm{ann}} = \mathrm{std}(r_t)\cdot\sqrt{252},
+  \qquad \mathrm{std}(r_t)=\sqrt{\frac{1}{n-1}\sum_{t=1}^{n}(r_t-\bar{r})^2}.
+\end{equation}
+
+\textbf{现实意义：} 衡量组合净值起伏剧烈程度——承担的风险尺度。本实验 $\sigma_{\mathrm{ann}}=29.6\%$；2025-04-07 单日 -12.15\% 等极端日会抬升波动率。波动越高，达到相同 Sharpe 所需的收益越高。
+
+\subsubsection{夏普比率（Sharpe Ratio）}
+
+\textbf{定义：} 单位风险所获得的超额收益（相对无风险利率 $r_f$）。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{Sharpe} = \frac{\mu_{\mathrm{ann}} - r_f}{\sigma_{\mathrm{ann}}}
+  = \frac{\bar{r}\times 252 - r_f}{\mathrm{std}(r_t)\cdot\sqrt{252}}.
+\end{equation}
+本实验取 $r_f=0$。
+
+\textbf{现实意义：} 综合评价「收益/风险」效率。本实验 Sharpe$=\textbf{1.28}$；档位 A 同窗 Sharpe$=\textbf{1.53}$ 略高，与 Top500 窄池、更低 MDD 及 $\beta\approx 1.0$ 有关。
+
+\subsubsection{最大回撤（Maximum Drawdown, MDD）}
+
+\textbf{定义：} 净值从历史最高点至后续最低点的最大跌幅。
+
+\textbf{公式：}
+\begin{equation}
+  \mathrm{peak}_t = \max_{\tau\le t} P_\tau,
+  \qquad
+  \mathrm{DD}_t = \frac{P_t - \mathrm{peak}_t}{\mathrm{peak}_t},
+  \qquad
+  \mathrm{MDD} = \min_t \mathrm{DD}_t \le 0.
+\end{equation}
+
+\textbf{现实意义：} 回答「最坏情况下从高点最多亏多少」。本实验 $\mathrm{MDD}=\textbf{-27.5\%}$；档位 A 同窗 $\mathrm{MDD}=\textbf{-9.2\%}$。C2 更深与 Top3000 广度、$\beta=1.33$ 及 2025-04 系统性下跌有关。
+
+\subsection{指标汇总表：档位 A vs 档位 C2（验证集）}
+
+\begin{table}[H]
+\centering
+\caption{评价指标验证集对照（2025-04-01 --- 2026-05-20；数据来自 \texttt{ic\_summary.json} / \texttt{backtest/*/valid/metrics.json}）}
+\label{tab:metrics-ac-c2}
+\small
+\begin{tabular}{llrr}
+\toprule
+\textbf{类别} & \textbf{指标} & \textbf{档位 A} & \textbf{档位 C2} \\
+\midrule
+\multirow{5}{*}{预测（全池）}
+  & 全市场 mean IC & 0.016 & \textbf{0.077} \\
+  & ICIR & 0.102 & \textbf{0.794} \\
+  & IC 标准差 $\sigma_{\mathrm{IC}}$ & 0.153 & \textbf{0.097} \\
+  & Top 10\% 内 IC & 0.013 & \textbf{0.014} \\
+  & 多空 spread（日） & $-0.116\%$ & \textbf{0.314\%} \\
+\midrule
+\multirow{4}{*}{预测（策略对齐）}
+  & IC@K（$K$=n\_max） & \textbf{0.0303} & $-0.0037$ \\
+  & IC@K 的 ICIR & \textbf{0.146} & $-0.020$ \\
+  & Top-$K$ 命中率 & 47.0\% & 50.1\% \\
+  & Top-$K$ 内 spread（年化） & 10.2\% & \textbf{21.8\%} \\
+  & 信号层组合（年化，无成本） & $-14.2\%$ & 34.1\% \\
+\midrule
+\multirow{6}{*}{回测（组合）}
+  & 总收益 $R_{\mathrm{tot}}$ & 32.2\% & \textbf{43.5\%} \\
+  & CAGR & 29.4\% & \textbf{39.6\%} \\
+  & Sharpe & \textbf{1.53} & 1.28 \\
+  & MDD & \textbf{-9.2\%} & $-27.5\%$ \\
+  & 相对沪深300 超额总收益 & 5.9\% & \textbf{15.0\%} \\
+  & 信息比率 IR（相对大盘） & 0.67 & \textbf{0.74} \\
+\midrule
+\multirow{2}{*}{相对大盘回归}
+  & 年化 Alpha $\alpha_{\mathrm{ann}}$ & 5.4\% & \textbf{9.0\%} \\
+  & Beta $\beta$ & \textbf{1.01} & 1.33 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{评价指标：公式与 C2 验证集数值（273 日，节选）}
+\label{tab:metric-def}
+\small
+\begin{tabular}{llp{3.5cm}r}
+\toprule
+\textbf{指标} & \textbf{核心公式} & \textbf{现实意义} & \textbf{C2} \\
+\midrule
+mean IC & $\frac{1}{D}\sum \mathrm{IC}_t$ & 平均排序能力 & 0.077 \\
+ICIR & $\overline{\mathrm{IC}}/\sigma_{\mathrm{IC}}$ & IC 稳定性 & 0.794 \\
+IC@K & $\overline{\mathrm{IC@K}}$ & 策略池内再排序 & $-0.004$ \\
+Top-$K$ 命中率 & $\overline{\mathrm{HR}}$ & 池内跑赢大盘比例 & 50.1\% \\
+Top-$K$ 内 spread & $\overline{\mathrm{ws}}$ & 池内高低分分化 & 0.086\%/日 \\
+Top 10\% IC & $\overline{\mathrm{IC}}^{\mathrm{top}}$ & 宽头部细分 & 0.014 \\
+多空 spread & $\overline{y}_{\mathrm{top}}-\overline{y}_{\mathrm{bot}}$ & 头尾分组 & 0.314\%/日 \\
+总收益 & $P_T/P_0-1$ & 区间盈亏 & 43.5\% \\
+Sharpe & $\mu_{\mathrm{ann}}/\sigma_{\mathrm{ann}}$ & 收益风险比 & 1.28 \\
+MDD & $\min \mathrm{DD}_t$ & 最大回撤 & $-27.5\%$ \\
+超额 IR & $\mathrm{IR}(r-r^b)$ & 相对大盘稳定超额 & 0.74 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{读数提醒：IC 与组合收益为何可能「不一致」}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{IC} 衡量 Top3000 全体排序；策略只用 Top 10\% 且最多 50 只——更该看 spread 与回测 $R_{\mathrm{tot}}$；
+  \item \textbf{spread 年化 79\%} 是未扣费、含做空底部的参考；实际只做多组合 43.5\% 总收益更低，属正常；
+  \item \textbf{IC@K} 与全市场 IC 可能背离：C2 全池 IC 高但 IC@K 略负，读数时须同时看表~\ref{tab:metrics-ac-c2}；
+  \item 档位 A 与档位 C2 已对齐验证时段；对比时仍须注意股票池与 \texttt{n\_max} 差异。
+\end{enumerate}
+\section{数据处理与特征工程}
+%==============================================================================
+
+本节按代码实际执行顺序，说明「原始 CSV $\to$ 模型可读张量」的全过程。档位 C 与档位 A 共用同一套 \texttt{code/src/} 流水线，差异在于：本实验股票池扩至 \textbf{Top 3000}、时序窗口 \textbf{$L=60$}、数据截止 \textbf{2026-05-20}，并在服务器上以 16 进程并行 prep。
+
+\subsection{整体流水线与数据形态变化}
+
+数据处理分三步，对应 \texttt{scripts/01\_build\_panel.py}、\texttt{02\_make\_features.py}、\texttt{02b\_embed\_news.py}：
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{建面板}：逐日 merge 量价、基本面、资金流 CSV，构造标签 $y_{i,t}$；
+  \item \textbf{做特征}：计算 16 维时序 + 9 维截面因子，逐日 GKX 变换，构造 60 日滑动窗口；
+  \item \textbf{处理新闻}：全市场快讯链指到个股，供 NewsLoRA 使用。
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.92\textwidth}{\small
+\textbf{数据形态变化（本实验）：}\\
+\texttt{daily/YYYYMMDD.csv}（单日全市场截面）\\
+$\Downarrow$ merge metric、moneyflow、ST 标记\\
+\texttt{panel\_daily.parquet}（长表：每行 = 某股某日，Top3000 过滤后约 3000 只 $\times$ 1500+ 交易日）\\
+$\Downarrow$ 技术指标 + GKX winsorize+rank\\
+\texttt{features/panel\_features.parquet}（prep job 7922 完成后约 1.4\,GB）\\
+$\Downarrow$ 新闻链指\\
+\texttt{news/panel\_news.parquet}\\
+$\Downarrow$ \texttt{DailyStockDataset} 预计算 $L=60$ 序列\\
+训练样本：每个 \texttt{(ts\_code, trade\_date)} $\to$ $(60,16)$ 序列 + $(9,)$ 截面 + 文本 + 标签
+}}
+\caption{从原始 CSV 到训练样本的形态变化}
+\label{fig:data-pipeline}
+\end{figure}
+
+\subsection{数据来源与使用字段}
+
+数据来自课程云盘，服务器路径 \texttt{../data/}，使用字段与档位 A 一致，本实验额外利用更长的 2025 年行情与新闻。
+
+\begin{table}[H]
+\centering
+\caption{数据来源与用途}
+\label{tab:data}
+\begin{tabular}{llp{5.2cm}}
+\toprule
+\textbf{类型} & \textbf{路径} & \textbf{用途} \\
+\midrule
+日频量价   & \texttt{daily/YYYYMMDD.csv}   & 开高低收、成交量、成交额 \\
+基本面     & \texttt{metric/YYYYMMDD.csv}    & PE、PB、换手率、市值等 \\
+资金流     & \texttt{moneyflow/YYYYMMDD.csv} & 大/中/小单买卖金额 \\
+新闻快讯   & \texttt{news/YYYYMMDD.csv}      & 标题+正文，链指到个股 \\
+ST 名单    & \texttt{stock\_st/}             & 剔除 ST \\
+指数       & \texttt{market/000300.SH.csv}   & 沪深 300，算超额收益 \\
+基础信息   & \texttt{basic.csv}              & 名称、行业、上市日期 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{第一步：构建面板（\texttt{01\_build\_panel.py}）}
+
+\paragraph{（1）逐日读取与合并}
+
+对每个 \texttt{trade\_date}，左连接 \texttt{daily}、\texttt{metric}、\texttt{moneyflow}，标记 ST，纵向拼接为长表。每一行对应一个 \texttt{(ts\_code, trade\_date)} 观测。
+
+\paragraph{（2）股票池过滤——Top 3000}
+
+与档位 A Top 500 相比，本实验在服务器上采用更宽覆盖：
+\begin{itemize}[leftmargin=2em]
+  \item 剔除 ST、北交所（.BJ）；
+  \item 上市满 \textbf{60} 个交易日；
+  \item 20 日平均成交额 $\geq$ \textbf{5000} 万元；
+  \item 按全样本平均流动性排序，保留 \textbf{Top 3000}（prep 日志确认最终 \textbf{3000} 只）。
+\end{itemize}
+更宽股票池使 IC 统计更稳定（验证集每日有效样本约 3000 只），但也引入更多中小票噪声，对组合层 MDD 有放大效应（见第~\ref{sec:results} 节）。
+
+\paragraph{（3）标签构造——无未来信息}
+
+\begin{equation}
+  y_{i,t} = r_{i,t+1} - r^{\mathrm{mkt}}_{t+1},
+  \qquad
+  r_{i,t+1} = \frac{P_{i,t+1}-P_{i,t}}{P_{i,t}}.
+\end{equation}
+代码用 \texttt{groupby(ts\_code).close.pct\_change().shift(-1)} 实现：在 \texttt{trade\_date=$t$} 行，特征仅用 $\le t$ 的信息，标签为 $t\!\to\! t\!+\!1$ 超额——与 A 股「盘后出信号、次日成交」一致。
+
+\paragraph{（4）资金流衍生}
+
+构造 \texttt{net\_mf\_ratio}（净流入/成交额）、\texttt{elg\_imb}、\texttt{lg\_imb}（大/特大单不平衡度），取值约在 $[-1,1]$，便于跨市值比较。
+
+\subsection{第二步：特征计算与 GKX 变换（\texttt{02\_make\_features.py}）}
+
+\paragraph{（1）时序技术指标（16 维，模态 A 输入）}
+
+对每只股票单独 \texttt{rolling} 计算，列名见 \texttt{feature\_meta.json}：
+
+\begin{table}[H]
+\centering
+\caption{时序特征含义（模态 A，$L=60$ 窗口）}
+\label{tab:seq-feat}
+\small
+\begin{tabular}{llp{5.8cm}}
+\toprule
+\textbf{特征名} & \textbf{计算方式} & \textbf{直观含义} \\
+\midrule
+\texttt{ret\_1d/5d/.../60d} & 收盘价 pct\_change & 多尺度动量；\textbf{60 日 ret} 为档位 C 新增相对 A 的长周期项 \\
+\texttt{vol\_10d/20d/60d}   & 日收益 rolling std & 波动率 \\
+\texttt{amp}                & $(high-low)/close$ & 振幅 \\
+\texttt{vwap\_dev}          & $(close-vwap)/vwap$ & 收盘价偏离均价 \\
+\texttt{log\_amount}        & $\log(1+\text{成交额})$ & 流动性 \\
+\texttt{net\_mf\_ratio} 等 & 见上节 & 资金结构 \\
+\texttt{turnover\_rate\_f}  & metric & 换手 \\
+\texttt{rsi\_14}            & 14 日 RSI & 超买超卖 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+窗口从档位 A 的 $L=20$ 扩展到 \textbf{$L=60$}（约一个季度），使 TFT-lite 能捕捉更长周期趋势与波动 regime；代价是 prep 与训练样本量增大（训练集约 \textbf{420 万} 股-日行，验证集约 \textbf{81 万}）。
+
+\paragraph{（2）截面特征（9 维，模态 B 输入）}
+
+\begin{table}[H]
+\centering
+\caption{截面特征含义（模态 B）}
+\label{tab:tab-feat}
+\small
+\begin{tabular}{llp{6cm}}
+\toprule
+\textbf{特征} & \textbf{来源} & \textbf{含义} \\
+\midrule
+\texttt{turnover\_rate\_f}, \texttt{volume\_ratio} & metric & 活跃度 \\
+\texttt{pb}, \texttt{pe\_ttm}, \texttt{pe\_missing} & metric & 估值与缺失指示 \\
+\texttt{log\_mv}           & 派生 & 规模因子 \\
+\texttt{net\_mf\_ratio}, \texttt{elg\_imb}, \texttt{lg\_imb} & moneyflow & 当日资金结构 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{（3）GKX 截面预处理}
+
+\textbf{原则：} 禁止全样本 \texttt{StandardScaler}，否则引入未来分布信息。
+
+对每个 \texttt{trade\_date}、每个特征列独立执行（\texttt{src/preprocess.py}，\texttt{winsor\_q=0.01}）：
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Winsorize}：截断当日最高/最低 1\% 极端值；
+  \item \textbf{Rank $\to [-1,1]$}：在当日 Top3000 横截面内排序并线性映射。
+\end{enumerate}
+\textbf{小例子：} 2025-04-01 当天 3000 只股票的 \texttt{pe\_ttm}，rank 最高者映射为 $+1$，最低者为 $-1$。GRU/MLP/Transformer 每天看到的输入尺度一致，且\textbf{仅使用当日及以前信息}。
+
+\subsection{第三步：新闻链指（\texttt{02b\_embed\_news.py}）}
+
+\paragraph{时间映射}
+
+15:00 之后发布的新闻映射到\textbf{下一交易日}；否则映射到当天（若为交易日）。保证 $t$ 日收盘后使用的文本不包含 $t$ 日收盘后的未公开信息。
+
+\paragraph{名称匹配}
+
+在 \texttt{title/content} 中匹配 \texttt{basic.csv} 的 \texttt{name}，同日同股多条新闻拼接。规则匹配存在漏链/误链，但 RoBERTa-LoRA 仍能在验证集获得 26.6\% 融合权重（见表~\ref{tab:fusion}），显著优于档位 A NewsHash 的 0.7\%。
+
+\subsection{第四步：滑动窗口样本（\texttt{DailyStockDataset}）}
+
+\begin{itemize}[leftmargin=2em]
+  \item 样本 = \texttt{(ts\_code, trade\_date)}；
+  \item 时序：过去 \textbf{60} 日 $\times$ 16 维 $\to$ $\mathbb{R}^{60\times 16}$，不足则 zero-padding + \texttt{mask}；
+  \item 截面：当日 9 维 $\to$ $\mathbb{R}^{9}$；
+  \item 静态：行业 id、\texttt{log\_mv}、\texttt{listing\_age}（供 TFT-lite）；
+  \item 标签：\texttt{excess\_ret\_1d}。
+\end{itemize}
+\textbf{划分原则：} \texttt{split\_by\_date} 严格按 \texttt{trade\_date} 切 train/valid，训练集内 shuffle，\textbf{禁止}把验证日混入训练。
+
+\subsection{时间划分与防泄露}
+
+\begin{table}[H]
+\centering
+\caption{本实验数据划分（来自 \texttt{ic\_summary.json}）}
+\label{tab:split-c}
+\begin{tabular}{lcll}
+\toprule
+\textbf{集合} & \textbf{截止规则} & \textbf{IC 天数} & \textbf{用途} \\
+\midrule
+训练集 & $\le$ 2025-03-31 & 1503（A）/ 1509（C） & 三模态训练 \\
+验证集 & 2025-04-01 --- 2026-05-20 & 273--274 & \textbf{唯一报告区间}：IC + 融合定权 + 回测 \\
+样本外 & 2026-06-01 --- 06-10（模拟赛） & --- & 真实下单；\textbf{不写入} IC/回测表 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+验证集为\textbf{赛前 holdout}：训练含 2025Q1，验证覆盖 2025Q2 至 2026-05-20（模拟赛前），使 ICIR 定权与回测更贴近 FDL2026 时间分布；模拟赛当周为样本外。
+
+\begin{table}[H]
+\centering
+\caption{防数据泄露自检（本实验）}
+\label{tab:leak-check}
+\small
+\begin{tabular}{p{3.8cm}p{4cm}p{4.8cm}}
+\toprule
+\textbf{错误做法} & \textbf{本实验做法} & \textbf{代码位置} \\
+\midrule
+全样本 fit Scaler & 逐日截面 winsorize+rank & \texttt{preprocess.py} \\
+用 $t\!+\!1$ 数据做 $t$ 特征 & 特征仅用 $\le t$ & \texttt{features.py} \\
+15:00 后新闻当天可用 & 映射到下一 trade\_date & \texttt{news\_link.py} \\
+随机打乱全部日期 & 按日期切 train/valid & \texttt{dataset.py} \\
+在 valid 上调参再报告 valid & 固定 3 seed，融合权重 frozen & \texttt{fusion\_weights.json} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+\section{模型设计与方法论}
+%==============================================================================
+
+本节说明 TFNE-C 三模态各自的学习目标、网络结构与训练/融合原理。可以将其理解为：三位「专家」分别阅读价量序列、截面因子与新闻文本，各自输出对 $y_{i,t}$ 的预测，再按历史 ICIR 加权投票。
+
+\subsection{总体架构 TFNE-C}
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.90\textwidth}{\centering
+\vspace{0.8em}
+\textbf{模态 A（TFT-lite）}：$(60,16)$ 序列 + 静态变量 $\xrightarrow{\text{LSTM+Attn}}$ $z_A$（×3 seed） \\[0.4em]
+\textbf{模态 B（FT-Transformer）}：9 维截面 $\xrightarrow{\text{Self-Attn}\times 4}$ $z_B$（×3 seed） \\[0.4em]
+\textbf{模态 C（NewsLoRA）}：新闻文本 $\xrightarrow{\text{RoBERTa+LoRA}}$ $z_C$（×3 seed） \\[0.6em]
+seed 内均值 $\xrightarrow{\text{逐日秩变换}}$ $r_A,r_B,r_C$ $\xrightarrow{\text{ICIR 定权}}$ score $\xrightarrow{\text{策略层}}$ 回测 \\[0.8em]
+}}
+\caption{TFNE-C 总体架构示意}
+\label{fig:arch-c}
+\end{figure}
+
+三模态\textbf{独立训练}、独立保存 \texttt{best.pt}，不在训练阶段做 end-to-end 联合优化——这样某模态（如新闻缺失日）可自动降权，工程上亦便于增量 predict。
+
+\subsection{模态 A：TFT-lite（时序分支）}
+
+\paragraph{设计动机}
+
+档位 A 用 2 层 GRU（$L=20$）编码价量，参数量小但难以对 60 步序列中「哪些交易日更重要」做显式加权。TFT-lite 借鉴 Temporal Fusion Transformer 思想：LSTM 提取序列表示，\textbf{时序注意力}对有效时间步加权汇聚，再与行业/市值等静态变量融合。
+
+\paragraph{网络结构（\texttt{SeqTFTLite}）}
+
+输入形状 $(B, 60, 16)$，$B$ 为 batch 内股-日样本数。前向过程：
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{双层 LSTM}（hidden=128，dropout=0.2）$\to$ $h_t \in \mathbb{R}^{128}$，$t=1,\ldots,60$；
+  \item \textbf{时序注意力}：$e_t = w^\top \tanh(W h_t)$，对 padding 位置 mask 为 $-\infty$，
+  $\alpha_t = \mathrm{softmax}(e_t)$，上下文 $c = \sum_t \alpha_t h_t$；
+  \item \textbf{静态嵌入}：行业 Embedding + \texttt{log\_mv}、\texttt{listing\_age} 投影为 $s \in \mathbb{R}^{128}$；
+  \item \textbf{融合头}：$[c; s] \to \mathrm{MLP} \to z_A \in \mathbb{R}$。
+\end{enumerate}
+
+\paragraph{训练与早停}
+
+损失为 Huber($\delta=1.0$)，优化器 AdamW（$lr=3\times10^{-4}$），batch=4096。每个 epoch 结束在验证集上算 mean IC，patience=6 早停。训练日志显示三 seed 最佳验证 IC 差异较大：
+
+\begin{table}[H]
+\centering
+\caption{TFT-lite 各 seed 最佳验证 IC（训练日志 job 7945）}
+\label{tab:tft-seed}
+\begin{tabular}{cccl}
+\toprule
+\textbf{seed} & \textbf{best val IC} & \textbf{best epoch} & \textbf{说明} \\
+\midrule
+42  & 0.0164 & 5  & 早停于 epoch 11，拟合较浅 \\
+123 & 0.0662 & 16 & 充分训练后 IC 最高 \\
+456 & 0.0448 & 16 & 中等 \\
+\midrule
+seed 内均值（融合前） & \multicolumn{3}{l}{约 0.04--0.05 量级，仍低于 FTT} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{原因分析：} Top3000 价量序列信噪比低，单 seed GRU/TFT 在日频上 IC 往往接近 0；三 seed 集成 + 更长训练（最多 18 epoch）后，融合阶段 TFT 仍获 35.3\% 权重，说明其在部分市场阶段（如趋势明显的月份）提供增量，而非单点 IC 最高。
+
+\subsection{模态 B：FT-Transformer（截面分支）}
+
+\paragraph{原理}
+
+Gorishniy 等（2021）提出：表格数据上，将每个数值特征视为一个 \textbf{token}，通过 Transformer 自注意力学习特征间交互（如「低 PB + 高换手 + 资金流入」的非线性组合），往往优于纯 MLP。
+
+\paragraph{实现（\texttt{TabFTTransformer}，\texttt{rtdl}）}
+
+9 个数值 token + 类别 token，$d_{\mathrm{token}}=128$，$n_{\mathrm{blocks}}=4$，attention/FFN dropout=0.2，输出标量 $z_B$。相对档位 A TabMLP（256-64-1），参数量与表达力均更强。
+
+\begin{table}[H]
+\centering
+\caption{FT-Transformer 各 seed 最佳验证 IC}
+\label{tab:ftt-seed}
+\begin{tabular}{ccc}
+\toprule
+\textbf{seed} & \textbf{best val IC} & \textbf{best epoch} \\
+\midrule
+42  & 0.0613 & 6 \\
+123 & 0.0660 & 4 \\
+456 & 0.0665 & 6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+三 seed IC 集中在 0.061--0.067，\textbf{方差远小于 TFT}，说明截面因子信号更稳定——与融合权重 38.1\%（三模态最高）一致。对比档位 A MLP 权重 34.1\% 但全市场 IC 仅 0.016：FTT 不仅权重相近，且\textbf{绝对 IC 水平}显著更高，是档位 C 相对 A 排序能力提升的主因。
+
+\subsection{模态 C：NewsLoRA（新闻分支）}
+
+\paragraph{原理}
+
+档位 A 用 HashingVectorizer 将文本映射为 256 维稀疏向量，无法建模语义，融合权重仅 0.7\%。本实验采用 \texttt{hfl/chinese-roberta-wwm-ext} 预训练编码器 + \textbf{LoRA}（$r=8, \alpha=16$）低秩微调：在冻结大部分 BERT 参数的同时，用少量可训练参数适配金融新闻域。
+
+\paragraph{训练设置}
+
+从训练集随机子采样 \textbf{8 万} 条（有新闻的股-日），最大长度 128 token，4 epoch，batch=64，$lr=2\times10^{-4}$。各 seed 最佳验证 IC：
+
+\begin{table}[H]
+\centering
+\caption{NewsLoRA 各 seed 最佳验证 IC}
+\label{tab:news-seed}
+\begin{tabular}{ccc}
+\toprule
+\textbf{seed} & \textbf{best val IC} & \textbf{best epoch} \\
+\midrule
+42  & 0.0366 & 1 \\
+123 & 0.0453 & 4 \\
+456 & 0.0390 & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{原因：} 新闻覆盖不全（无新闻日 rank\_C 为 NaN），且事件驱动 alpha 本身稀疏；但 0.04 量级 IC 已远高于 NewsHash，使融合权重从 0.7\% 升至 \textbf{26.6\%}。推理阶段 \texttt{04\_ensemble\_predict.py} 支持从 checkpoint 全量推理（约 8 h），保证增量 predict 时 News 模态完整参与。
+
+\subsection{训练目标与优化细节}
+
+三模态回归目标均为 $y_{i,t}$（超额收益），但\textbf{模型选择指标}为验证集 Spearman IC 而非 MSE——因为策略按 score 排序选股，IC 与下游目标一致。
+
+\paragraph{Huber 损失}
+
+\begin{equation}
+  \mathcal{L}_{\mathrm{Huber}}(e) =
+  \begin{cases}
+    \frac{1}{2}e^2, & |e| \le \delta \\
+    \delta(|e| - \frac{1}{2}\delta), & |e| > \delta
+  \end{cases}
+  \quad (\delta=1.0)
+\end{equation}
+对涨跌停等极端 $y$ 比纯 MSE 更稳健，与档位 A 相同。
+
+\paragraph{数值稳定}
+
+Top3000 全量 TFT 训练时开启 AMP 曾出现 \texttt{loss=nan}，故本实验 \texttt{amp=false}、\texttt{tf32=false}，以约 20\% 速度换取稳定收敛。
+
+\begin{table}[H]
+\centering
+\caption{档位 C 训练超参与实测耗时（job 7945）}
+\label{tab:hyper-c}
+\begin{tabular}{llp{5cm}}
+\toprule
+\textbf{项} & \textbf{取值} & \textbf{说明} \\
+\midrule
+优化器 & AdamW, $lr=3\times 10^{-4}$ & TFT/FTT \\
+News $lr$ & $2\times 10^{-4}$ & LoRA 微调 \\
+损失 & Huber($\delta=1.0$) & \\
+batch & 4096（股-日） & \\
+TFT/FTT & max 18 epoch, patience 6 & \\
+News & 4 epoch, 8 万样本/seed & \\
+TFT 训练 & 3×seed，共 $\approx$18.4 h & \\
+FTT 训练 & 3×seed，共 $\approx$11.9 h & \\
+News 训练 & 3×seed，共 $\approx$0.7 h & \\
+04 融合推理 & $\approx$8.0 h & 534 万行 × 6 次推理 \\
+墙钟总时长 & $\approx$39 h & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{多 seed 集成与秩融合}
+
+\paragraph{Step 1：seed 内平均}
+
+对每个模态、每个 \texttt{(trade\_date, ts\_code)}，对 $z^{(seed)}$ 取算术平均得 $z_A, z_B, z_C$。
+
+\paragraph{Step 2：逐日截面秩变换}
+
+在每个 trade\_date 内，对 $z_A,z_B,z_C$ 分别 winsorize（$q=0.01$）再 rank 到 $[0,1]$，得 $r_A,r_B,r_C$。缺失模态（如无新闻）对应 rank 为 NaN，\textbf{不参与}当日加权。
+
+\paragraph{Step 3：ICIR 定权}
+
+在验证集上分别计算 A/B/C 的日度 IC 序列，
+\begin{equation}
+  \mathrm{ICIR}_m = \frac{\overline{\mathrm{IC}}_m}{\mathrm{std}(\mathrm{IC}_m)}, \quad
+  w_m = \frac{\max(\mathrm{ICIR}_m, 0)}{\sum_k \max(\mathrm{ICIR}_k, 0)}.
+\end{equation}
+
+本实验得到 $w_A=35.3\%$, $w_B=38.1\%$, $w_C=26.6\%$。融合 score：
+\begin{equation}
+  \mathrm{score}_{i,t} = w_A r_{A,i,t} + w_B r_{B,i,t} + w_C r_{C,i,t}.
+\end{equation}
+
+\textbf{与档位 A 对比：} A 为 GRU 62.9\% / MLP 36.4\% / Hash 0.7\%——时序独大、新闻近零。C 三分支更均衡，说明 Transformer 升级后\textbf{新闻与截面}均成为有效 alpha 来源，而非仅靠价量时序。
+
+%==============================================================================
+\section{交易策略与回测设置}
+\label{sec:strategy}
+%==============================================================================
+
+预测模型输出的是\textbf{分数（score）}，不能直接变成账户收益。策略层（\texttt{src/strategy.py}）负责回答：「今天应该买哪些股票、各买多少？」回测层（\texttt{src/backtest.py}）再按 A 股交易规则模拟成交，得到净值曲线。本节详细说明策略逻辑、合理性分析，以及回测引擎的逐步执行过程。
+
+\subsection{与作业 PDF 及档位 A 的关系}
+
+作业 PDF 推荐\textbf{Top-$k$ 轮换策略}：首日等权买入得分最高的 $n$ 只（$n=5\text{--}30$），之后每日卖出持仓中得分最低的 $k$ 只、换入全市场得分最高的 $k$ 只。
+
+\textbf{本方案（与档位 A 同框架）的扩展：}
+\begin{itemize}[leftmargin=2em]
+  \item 保留「按 score 排序选股」核心思想；
+  \item 将「等权 $n$ 只」改为\textbf{按分数 softmax 式加权}，使 score 越高权重越大；
+  \item 加入单票/行业上限、现金缓冲、波动率防守、换手上限——更易满足比赛「尽可能满仓」并控制集中度风险；
+  \item 本实验 \texttt{n\_max=50}（档位 A 为 30），适配 Top3000 更宽候选池。
+\end{itemize}
+
+\subsection{可交易 universe：哪些股票允许买？}
+
+在计算目标权重前，\texttt{tradable\_universe} 对当日面板过滤（与 prep 规则一致）：
+\begin{itemize}[leftmargin=2em]
+  \item 剔除 ST、北交所（.BJ）；
+  \item 当日成交量 $>0$（排除停牌）；
+  \item 上市满 \textbf{60} 个交易日；
+  \item 20 日平均成交额 $\geq$ \textbf{5000} 万元。
+\end{itemize}
+
+\textbf{意义：} 模型对 Top3000 全池都有 score，但策略只在「 realistically 能买到」的标的上建仓，避免回测买入不可成交股票。过滤后当日有效 score 通常仍为数百至千余只（验证集 IC 统计要求每日 $\ge 30$ 只有效样本）。
+
+\subsection{每日策略计算：\texttt{target\_weights} 分步说明}
+
+函数 \texttt{target\_weights(scores, industries, log\_mv, params, mkt\_vol)} 输入当日可交易股票的 score、行业、对数市值，输出目标权重 $w_i$（不含现金；现金由 $c_t$ 单独留出）。
+
+\paragraph{Step 1：头部候选池（与 IC 评估对齐）}
+
+\begin{equation}
+  \mathcal{C}_t = \left\{ i \mid s_{i,t} \ge Q_{0.90}(s_{\cdot,t}) \right\},
+\end{equation}
+即 score 位于当日 \textbf{Top 10\%}（\texttt{q\_min=0.90}）。Top3000 下 $|\mathcal{C}_t|\approx 300$ 只。这与 IC 评估中的 Top 分位指标一致——策略只在模型最有把握的头部区域建仓，而非全市场均匀暴露。
+
+\paragraph{Step 2：取前 \texttt{n\_max} 只}
+
+按 score 降序取前 \textbf{50} 只（\texttt{n\_max=50}），记为集合 $\mathcal{H}_t$。
+
+\paragraph{Step 3：分数 $\to$ 初始权重（softmax 式）}
+
+对 $\mathcal{H}_t$ 内 score 做百分位 rank $r_i\in[0,1]$，计算
+\begin{equation}
+  \tilde{w}_i = \exp\!\left(\frac{r_i - 0.5}{\tau}\right), \quad \tau=0.5,
+  \qquad
+  w_i^{(0)} = \frac{\tilde{w}_i}{\sum_{j\in\mathcal{H}_t}\tilde{w}_j}.
+\end{equation}
+$\tau=0.5$ 时，score 最高者权重约为最低者的 $e^{1}\approx 2.7$ 倍——\textbf{比等权更倾斜}于头部，但不如 argmax 全押一只极端。
+
+\paragraph{Step 4：风险约束迭代}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{单票上限}（\texttt{w\_max=0.05}）：任一 $w_i\le 5\%$，超出部分迭代重分给未触顶股票（最多 5 轮）；
+  \item \textbf{行业上限}（\texttt{w\_ind\_max=0.25}）：同一 \texttt{industry} 合计 $\le 25\%$，超标则行业内等比例缩放；
+  \item \textbf{微盘降权}（\texttt{downweight\_microcap=True}）：$\mathcal{H}_t$ 内 \texttt{log\_mv} 最低 10\% 股票权重 $\times 0.5$，再归一化——降低流动性差小票的风险；
+  \item \textbf{留现金}：
+  \begin{equation}
+    c_t = c_{\min} + \gamma_{\mathrm{vol}}\cdot\mathbb{1}[v^{\mathrm{mkt}}_t > v^{\mathrm{mkt}}_{80}],
+    \quad c_{\min}=3\%,\ \gamma_{\mathrm{vol}}=5\%,
+  \end{equation}
+  其中 $v^{\mathrm{mkt}}_{80}$ 为训练期市场波动率 80\% 分位（\texttt{compute\_mkt\_vol\_threshold} 在 \texttt{train\_end=20250331} 前估计）。最终 $w_i \leftarrow w_i\cdot(1-c_t)$。
+\end{enumerate}
+
+\textbf{数值示例：} 最新调仓 \texttt{orders\_20260520.csv} 含 50 只股票，权重合计 \textbf{97.0\%}，最高单票 002594.SZ 为 \textbf{5.01\%}（触顶 \texttt{w\_max}），其余 3\% 为现金缓冲——符合「尽可能满仓」要求。
+
+\begin{table}[H]
+\centering
+\caption{本实验交易策略参数（\texttt{config.server\_c2\_72h.yaml}）}
+\label{tab:strategy}
+\begin{tabular}{llp{5.2cm}}
+\toprule
+\textbf{参数} & \textbf{取值} & \textbf{作用} \\
+\midrule
+\texttt{q\_min} & 0.90 & 只在 Top 10\% score 中选股 \\
+\texttt{n\_max} & 50 & 目标组合最多 50 只 \\
+\texttt{tau} & 0.5 & 权重集中度；越小越集中 \\
+\texttt{w\_max} & 5\% & 单票权重上限 \\
+\texttt{w\_ind\_max} & 25\% & 单行业权重上限 \\
+\texttt{c\_min} & 3\% & 基础现金比例 \\
+\texttt{gamma\_vol} & 5\% & 高波动日额外现金 \\
+\texttt{delta} & 1\% & 目标偏离 $<1\%$ 总资产则不调 \\
+\texttt{omega\_max} & 25\% & 单日最大换手率 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{策略合理性分析}
+
+\paragraph{（1）Top 10\% 候选 + 加权持仓——与 alpha 来源一致}
+
+验证集全市场 mean IC 为 0.077，但 Top 10\% 内 IC 仅 0.014：说明模型对「头尾分组」的区分力强于「头部内部精细排序」。策略只交易 Top 10\% 并最多持 50 只，与 spread 指标（日均 0.314\%）所衡量的对象一致，避免在全市场噪声段浪费仓位。
+
+\paragraph{（2）softmax 加权 vs 等权——利用 score 幅度信息}
+
+秩融合后 score 已在 $[0,1]$ 附近，rank+exp 加权使更高 score 获得更多资金，比 PDF 等权 Top-$k$ 更充分利用模型输出；$\tau=0.5$ 在「集中押注最强信号」与「分散 idiosyncratic 风险」之间折中。
+
+\paragraph{（3）单票 5\%、行业 25\%——控制集中度}
+
+Top3000 池中单一行业（如券商、新能源）可能在某日同时占据多个高分位。行业 cap 防止组合在单一板块上过度暴露；单票 5\% cap 防止对个别「极端高分」标的 all-in。回测中 2025-04-07 单日 -12.15\% 的极端下跌说明系统性风险仍无法完全通过分散消除，但 caps 限制了单票冲击。
+
+\paragraph{（4）3\%+ 波动率防守现金——兼顾满仓与风控}
+
+比赛要求尽可能满仓，完全不留现金不现实（涨跌停、整手约束会导致部分资金闲置）。3\% 基础现金 + 高波动日额外 5\% 是\textbf{规则化风控}：当 $v^{\mathrm{mkt}}_t$ 超过训练期 80\% 分位时自动降杠杆，不依赖人工择时。
+
+\paragraph{（5）软换仓（\texttt{delta}、\texttt{omega\_max}）——贴近真实交易摩擦}
+
+硬换仓（每日完全对齐目标权重）在 A 股会产生过高换手与成本。本策略：
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{delta=1\%}：忽略小于总资产 1\% 的偏离，减少无意义小单；
+  \item \texttt{omega\_max=25\%}：单日买卖金额不超过总资产的 25\%，避免 score 日际剧变导致一次性清仓/建仓。
+\end{itemize}
+\textbf{副作用（需在报告中诚实说明）：} 验证集回测中持仓数 \texttt{n\_hold} 从期初 34 只逐步升至后期约 160--206 只（均值约 184），高于 \texttt{n\_max=50} 的\textbf{目标}持仓数——原因是换手上限使「应卖出的旧仓」无法在一日内全部清掉，属于软换仓的滞后效应，而非目标权重公式本身持 200 只。
+
+\paragraph{（6）与档位 A 策略差异}
+
+\begin{table}[H]
+\centering
+\caption{档位 A 与本实验策略参数差异}
+\label{tab:strategy-vs-a}
+\small
+\begin{tabular}{lllp{4.5cm}}
+\toprule
+\textbf{维度} & \textbf{档位 A} & \textbf{本实验} & \textbf{合理性} \\
+\midrule
+\texttt{n\_max} & 30 & 50 & Top3000 候选更宽，略增分散度 \\
+其余参数 & 相同 & 相同 & 对比时策略层一致，差异主要来自 score \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{回测引擎：整体流程}
+
+回测入口 \texttt{scripts/06\_backtest.py}：读取 \texttt{panel\_features.parquet} 与 \texttt{ensemble\_scores.parquet}，在验证集 \texttt{20250401}--\texttt{20260520} 上调用 \texttt{run\_backtest}，输出 \texttt{equity\_curve.csv} 与 \texttt{metrics.json}。
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.92\textwidth}{\small
+\textbf{回测主循环（每个交易日 $t=1,\ldots,T-1$）：}\\
+(1) 用 $t$ 日收盘价计算当前净值 $W_t = \text{cash} + \sum_i \text{shares}_i\cdot P_{i,t}^{\mathrm{close}}$\\
+(2) 取 $t$ 日 score，经 \texttt{tradable\_universe} 过滤 $\to$ \texttt{target\_weights} 得 $w_i^{\mathrm{tgt}}$\\
+(3) 在 $t\!+\!1$ 日以\textbf{开盘价}（缺失则收盘价）执行 \texttt{rebalance\_day}\\
+(4) 扣除佣金/印花税/滑点；更新 T+1 可卖标记\\
+(5) 记录 $t$ 日净值、现金、持仓数 \texttt{n\_hold}
+}}
+\caption{回测引擎 \texttt{run\_backtest} 主循环示意}
+\label{fig:bt-loop}
+\end{figure}
+
+\subsection{单日回测时间线（T+1 无未来信息）}
+
+\begin{table}[H]
+\centering
+\caption{单日回测时间线（$t$ 为信号日，$t\!+\!1$ 为执行日）}
+\label{tab:bt-timeline}
+\small
+\begin{tabular}{p{2.4cm}p{10.2cm}}
+\toprule
+\textbf{时点} & \textbf{发生什么} \\
+\midrule
+$t$ 日收盘后 & 使用 $\le t$ 的特征与新闻得到融合 score $s_{i,t}$（与训练标签 $y_{i,t}=r_{i,t+1}-r^{\mathrm{mkt}}_{t+1}$ 的时间对齐） \\
+$t$ 日收盘后 & 在可交易 universe 上计算目标权重 $w_{i,t}^{\mathrm{tgt}}$ \\
+$t\!+\!1$ 日开盘 & 以 $P_{i,t+1}^{\mathrm{open}}$ 尝试调仓（无 open 则用 close） \\
+执行顺序 & \textbf{先卖后买}：卖出释放现金，再买入新标的 \\
+整手约束 & 买卖股数 = $\lfloor |\Delta V|/(100\cdot P) \rfloor \times 100$ \\
+涨停过滤 & $t\!+\!1$ 日涨幅 $\ge 9.5\%$ 的标的\textbf{不买} \\
+T+1 可卖 & $t\!+\!1$ 日买入的仓位 \texttt{sellable=False}，$t\!+\!2$ 起可卖 \\
+成本 & 佣金 0.015\%、卖出印花税 0.05\%、滑点 0.05\%（双边均扣） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{因果性说明：} $t$ 日记录的净值使用 $t$ 日收盘价估值，但调仓执行在 $t\!+\!1$——与「盘后出信号、次日交易」一致，\textbf{不使用} $t\!+\!1$ 日收盘价在 $t$ 日决策。
+
+\subsection{调仓逻辑 \texttt{rebalance\_day} 详解}
+
+设当前总资产 $W$，当前持仓市值 $V_i^{\mathrm{cur}}$，目标权重 $w_i^{\mathrm{tgt}}$。
+
+\paragraph{Step 1：计算目标市值与偏离}
+
+\begin{equation}
+  V_i^{\mathrm{tgt}} = W \cdot w_i^{\mathrm{tgt}}, \qquad
+  \Delta V_i = V_i^{\mathrm{tgt}} - V_i^{\mathrm{cur}}.
+\end{equation}
+若 $|\Delta V_i|/W < \delta$（1\%），则跳过该标的——降低噪声换手。
+
+\paragraph{Step 2：T+1 卖出约束}
+
+若 $\Delta V_i < 0$（应卖）但该仓 $t\!+\!1$ 日不可卖（当日新买），则跳过——符合 A 股 T+1 规则。
+
+\paragraph{Step 3：换手上限缩放}
+
+估算单日换手率 $\omega = \sum_i|\Delta V_i|/(2W)$。若 $\omega > \omega_{\max}=25\%$，所有 $\Delta V_i$ 等比例缩小——模拟「大单无法一日全部成交」。
+
+\paragraph{Step 4：先卖后买 + 整手}
+
+卖出：按整手向下取整，不超过当前持仓；买入：按整手向下取整，不超过可用现金。无法成交的零头留到下一日。
+
+\paragraph{Step 5：费用扣除}
+
+每笔成交金额 $V_{\mathrm{trade}}$：
+\begin{itemize}[leftmargin=2em]
+  \item 佣金：$V_{\mathrm{trade}}\times 0.00015$（买卖均收）；
+  \item 印花税：$V_{\mathrm{trade}}\times 0.0005$（仅卖出）；
+  \item 滑点：$V_{\mathrm{trade}}\times 0.0005$。
+\end{itemize}
+粗略单边总成本约 0.02\%--0.07\%，273 日累计对净值的侵蚀显著，是组合收益低于 spread 理论值的重要原因。
+
+\subsection{回测配置与验证集设置}
+
+\begin{table}[H]
+\centering
+\caption{回测配置（\texttt{BacktestConfig} + 验证区间）}
+\label{tab:bt-config}
+\begin{tabular}{llp{4.8cm}}
+\toprule
+\textbf{项} & \textbf{取值} & \textbf{说明} \\
+\midrule
+初始资金 & 100 万元 & \\
+回测区间 & 2025-04-01 --- 2026-05-20 & 273 个交易日 \\
+score 来源 & \texttt{ensemble\_scores.parquet} & 融合后 score \\
+面板来源 & \texttt{panel\_features.parquet} & 含价格、行业、市值 \\
+整手 & 100 股 & \texttt{lot\_size=100} \\
+无风险利率 & 0 & Sharpe 计算用 \\
+年化天数 & 252 & CAGR/波动率年化 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+本配置 \texttt{test\_end=null}，\textbf{仅对 valid 段回测}；模拟赛 2026-06-01 至 06-10 为样本外，不在 \texttt{backtest/*/test/} 中报告。
+
+\subsection{回测过程观察（基于 \texttt{equity\_curve.csv}）}
+
+从验证集净值序列可提取以下\textbf{过程特征}，用于理解表~\ref{tab:bt-valid} 中指标的形成机制：
+
+\begin{table}[H]
+\centering
+\caption{验证集回测过程统计（由净值曲线计算）}
+\label{tab:bt-process}
+\small
+\begin{tabular}{llp{5.5cm}}
+\toprule
+\textbf{指标} & \textbf{数值} & \textbf{含义} \\
+\midrule
+期初净值 & 100.01 万元（2025-04-01） & 初始资金 + 首日微小调仓 \\
+谷底净值 & $\approx$72.5 万元 & 对应 MDD $\mathbf{-27.5\%}$（\texttt{metrics.json}） \\
+期末净值 & 143.5 万元（2026-05-20） & 总收益 43.5\% \\
+最大单日跌幅 & $-12.15\%$（2025-04-07） & 系统性下跌 + 高 beta 暴露 \\
+最大单日涨幅 & $+4.81\%$（2026-04-08） & 反弹段 \\
+持仓数 \texttt{n\_hold} & 34 $\to$ 206（均值约 184） & 软换仓滞后，实际持仓可高于 \texttt{n\_max} \\
+现金占比 & 均值约 0.37\% & 大部分时间接近满仓 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{过程解读：}
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{2025-04 初：} 市场剧烈调整，组合在 4 月前两周快速建仓（\texttt{n\_hold} 34 $\to$ 97），4 月 7 日单日 -12\% 导致净值大幅回撤，4 月整月收益 -17.22\%；
+  \item \textbf{2025-06 底：} 净值触底 74.96 万，此后随 IC 滚动均值回升（图~\ref{fig:ic-ts}）与 2025-08（+16.87\%）、2026-01（+15.28\%）等强势月份修复；
+  \item \textbf{2026-05 末：} 净值 143.5 万，5 月单月 +19.40\%，与最新调仓高 score 板块（制造、券商等）一致；
+  \item \textbf{成本与换手：} 273 日累计调仓在换手上限约束下渐进进行，费用从 gross spread 中扣除，使 40\% 总收益低于 spread 年化 79\% 的理论参考。
+\end{enumerate}
+
+\subsection{从目标权重到模拟下单}
+
+\texttt{07\_predict\_latest.py} 在最后一个交易日生成 \texttt{orders\_YYYYMMDD.csv}，列 \texttt{ts\_code}、\texttt{target\_weight}。模拟赛操作：
+\begin{enumerate}[leftmargin=2em]
+  \item 每个交易日 $T$ 收盘后更新数据并运行预测流水线；
+  \item 目标市值 $= W_T \times \texttt{target\_weight}$；
+  \item 与当前持仓 diff 得买卖清单，$T\!+\!1$ 按 100 股整手委托。
+\end{enumerate}
+Top 15 权重见图~\ref{fig:orders}（见第~\ref{sec:results} 节）。
+
+
+%==============================================================================
+\section{实验结果与对比分析}
+\label{sec:results}
+%==============================================================================
+
+本节结合 \texttt{ic\_summary.json}、\texttt{backtest/tier\_c2/valid/} 与训练日志，对预测指标、净值曲线、融合权重进行\textbf{数值—机理}对照分析，并与档位 A 基线比较。
+
+\subsection{预测能力：IC / ICIR / Spread}
+
+\begin{table}[H]
+\centering
+\caption{本实验——训练集预测指标（融合 score，1509 日）}
+\label{tab:ic-train}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{指标} & \textbf{mean IC / spread} & \textbf{std} & \textbf{ICIR / 年化} & \textbf{天数} \\
+\midrule
+全市场 IC     & 0.0742 & 0.096 & 0.769 & 1509 \\
+Top 10\% 内 IC & 0.0161 & 0.079 & 0.202 & 1509 \\
+多空 spread（日） & 0.475\% & 1.06\% & 年化 119.7\% & 1509 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{本实验——验证集预测指标（2025-04-01 --- 2026-05-20，273 日）}
+\label{tab:ic-valid}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{指标} & \textbf{mean IC / spread} & \textbf{std} & \textbf{ICIR / 年化} & \textbf{天数} \\
+\midrule
+全市场 IC     & \textbf{0.0769} & 0.097 & \textbf{0.794} & 273 \\
+Top 10\% 内 IC & 0.0143 & 0.079 & 0.181 & 273 \\
+多空 spread（日） & 0.314\% & 1.11\% & 年化 79.0\% & 273 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{（1）全市场 IC 与 ICIR——排序能力显著提升}
+
+验证集 mean IC = \textbf{0.0769}，ICIR = \textbf{0.794}；训练集 IC = 0.0742，ICIR = 0.769。\textbf{验证略高于训练}，说明在 2025-04 起的 holdout 上未出现明显过拟合崩塌。对比同口径档位 A 验证 IC 0.016、ICIR 0.102：本实验 IC 约为 A 的 \textbf{4.8 倍}，ICIR 约为 \textbf{7.8 倍}。
+
+\textbf{原因分解：}
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{截面 Transformer（主因）}：FTT 单 seed 验证 IC 0.061--0.067，远高于 A 的 MLP 在 500 只池上的弱信号；Top3000 扩大横截面，IC 估计更稳定（std 0.097 vs A 的 0.153）；
+  \item \textbf{新闻语义（次因）}：NewsLoRA 权重 26.6\%，提供 A 不具备的事件驱动信息；
+  \item \textbf{更长窗口与三 seed（辅助）}：$L=60$ 与多 seed 降低 TFT 单 seed 方差，使时序模态在融合中占 35.3\% 而非 A 的 GRU 独大 62.9\%。
+\end{itemize}
+
+\paragraph{（2）Top 10\% 内 IC 与 spread——「宽头部难细分，头尾仍可区分」}
+
+验证集 Top 10\% 内 IC：C2 为 0.014，A 为 0.013，均偏低。多空 spread：C2 日均 \textbf{0.314\%}（年化 79.0\%），A 为 \textbf{$-0.116\%$/日}——A 在「全池头尾 10\%」分组上略负，但经 \texttt{target\_weights} 与 Top500 窄池筛选后，组合回测仍可获 32.2\% 总收益；说明\textbf{策略层约束}改变了可交易 alpha 的来源。
+
+\subsection{策略对齐指标与相对大盘：A vs C2 详析}
+\label{sec:strategy-metrics}
+
+表~\ref{tab:metrics-ac-c2} 与表~\ref{tab:strategy-topk-full} 汇总策略对齐指标（数据源：\texttt{metrics/*/strategy\_topk.json}，本机命令 \texttt{python scripts/print\_strategy\_topk\_metrics.py}，2026-05-25）。\textbf{报告正文仅引用 valid 行}；train 供过拟合自检；\texttt{test} 行因 \texttt{test\_end=null} 样本过少（A：$n=1$，C2：$n=0$）\textbf{不纳入结论}。
+
+\paragraph{（1）IC@K：C2「进池强、池内弱」，A「全池弱、池内相对更好」}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{档位 A 验证集}（$K$=30）：IC@K$=+0.0303$，ICIR@K$=+0.146$（$n=274$）。Top500 经 $Q_{0.90}$ 过滤后的 30 只候选内，score 对次日超额仍呈弱正秩相关——$K$ 较小、候选更精，Spearman 更易为正。
+  \item \textbf{档位 C2 验证集}（$K$=50）：IC@K$=-0.0037$，ICIR@K$=-0.020$（$n=273$）。全市场 IC 0.077 未转化为「最终 50 只」内的稳定排序；alpha 主要体现在\textbf{进 Top 池}与头尾 spread，而非池内座次。
+  \item \textbf{训练 vs 验证：} A 的 IC@K 从 train $+0.0132$ 升至 valid $+0.0303$（holdout 上\textbf{未塌}）；C2 从 train $+0.0029$ 降至 valid $-0.0037$（池内排序略弱化，但全市场 IC 仍升）。
+  \item \textbf{启示：} 模拟赛若依赖 Top-$K$ 加权，C2 应更看 spread / 回测；若要提升 IC@K，需针对 $K$ 缩小候选或二次筛票，而非仅追全市场 IC。
+\end{itemize}
+
+\paragraph{（2）命中率、Top-$K$ 内 spread 与信号层收益}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{命中率（valid）：} A 47.0\%，C2 50.1\%——均接近 50\%，单日「跑赢大盘」比例接近随机；组合 PnL 来自权重倾斜与多日复利。
+  \item \textbf{Top-$K$ 内 spread（valid，年化）：} A \textbf{10.2\%}，C2 \textbf{21.8\%}（train：A $-1.4\%$，C2 16.6\%）。C2 池内「高分半仓 vs 低分半仓」分化更厚，与 IC@K 略负不矛盾。
+  \item \textbf{信号层 signal\_ann（valid，无成本）：} A \textbf{$-14.2\%$} vs 同窗回测 \textbf{+32.2\%}；C2 \textbf{+34.1\%} vs 回测 \textbf{+43.5\%}。A 的严重背离因 \texttt{risk\_adjust} 与信号层假设（每日完美调仓、无成本）与真实回测路径不同——\textbf{组合结论以扣费回测为准}。
+\end{itemize}
+
+\paragraph{（3）相对大盘：C2 超额更厚，但 beta 更高}
+
+验证集同窗沪深300 总收益 24.8\%，Sharpe 1.39，MDD $-7.8\%$。
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{档位 A}：超额总收益 5.9\%，IR 0.67，$\alpha_{\mathrm{ann}}=5.4\%$，$\beta=1.01$——接近市场中性暴露，回撤浅（MDD $-9.2\%$）。
+  \item \textbf{档位 C2}：超额总收益 \textbf{15.0\%}，IR \textbf{0.74}，$\alpha_{\mathrm{ann}}=\textbf{9.0\%}$，$\beta=\textbf{1.33}$——绝对 alpha 更高，但市场下行时放大亏损（2025-04 单日 $-12\%$ 与 $\beta>1$ 一致）。
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{策略 Top-$K$ 指标完整输出（\texttt{print\_strategy\_topk\_metrics.py}，2026-05-25）}
+\label{tab:strategy-topk-full}
+\footnotesize
+\begin{tabular}{llrrrrr}
+\toprule
+\textbf{档位} & \textbf{集合} & \textbf{IC@K} & \textbf{ICIR@K} & \textbf{命中率} & \textbf{within\_ann} & \textbf{signal\_ann} \\
+\midrule
+\multirow{2}{*}{A ($K$=30)}
+  & train & $+0.0132$ & $+0.056$ & 50.3\% & $-1.4\%$ & $+13.1\%$ \\
+  & \textbf{valid} & $\mathbf{+0.0303}$ & $\mathbf{+0.146}$ & \textbf{47.0\%} & \textbf{10.2\%} & $\mathbf{-14.2\%}$ \\
+\midrule
+\multirow{2}{*}{C2 ($K$=50)}
+  & train & $+0.0029$ & $+0.015$ & 51.1\% & 16.6\% & $+52.4\%$ \\
+  & \textbf{valid} & $\mathbf{-0.0037}$ & $\mathbf{-0.020}$ & \textbf{50.1\%} & \textbf{21.8\%} & $\mathbf{+34.1\%}$ \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4em}
+\small 注：within\_ann = Top-$K$ 内 spread 年化；signal\_ann = 信号层组合年化超额（无交易成本）。valid 区间 20250401--20260520；A valid $n=274$，C2 valid $n=273$。
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{策略对齐指标验证集对照（摘自表~\ref{tab:strategy-topk-full} valid 行）}
+\label{tab:strategy-topk-detail}
+\begin{tabular}{lcc}
+\toprule
+\textbf{指标} & \textbf{档位 A} & \textbf{档位 C2} \\
+\midrule
+IC@K & $+0.0303$ & $-0.0037$ \\
+ICIR@K & $+0.146$ & $-0.020$ \\
+Top-$K$ 命中率 & 47.0\% & 50.1\% \\
+Top-$K$ 内 spread（年化） & 10.2\% & 21.8\% \\
+信号层组合（年化，无成本） & $-14.2\%$ & $+34.1\%$ \\
+同窗回测总收益（扣费） & \textbf{+32.2\%} & \textbf{+43.5\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{（4）训练 vs 验证 spread 下降}
+
+训练 spread 年化 119.7\%，验证 79.0\%，验证更低属正常：holdout 时段含 2025 年 4 月极端行情（见下节），且验证集不可用于调参，组合层不会「过拟合 spread」。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{fig2_ic_summary.png}
+\caption{训练集与验证集 IC / ICIR 对比（融合 score）}
+\label{fig:ic-bar}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{fig5_ic_timeseries.png}
+\caption{日度 Spearman IC 及 20 日滚动均值（虚线：验证集 2025-04-01 起点）}
+\label{fig:ic-ts}
+\end{figure}
+
+图~\ref{fig:ic-ts} 显示：2025-04 初 IC 波动加剧（与市场系统性下跌同步），2025-07 后滚动 IC 均值多在 0.05--0.10 区间，2026 年初再度抬升——说明 alpha 具有\textbf{时变}特征，ICIR 0.794 已部分反映这种日际波动。
+
+\subsection{历史回测（验证集）}
+
+\begin{table}[H]
+\centering
+\caption{本实验——验证集历史回测（273 个交易日）}
+\label{tab:bt-valid}
+\begin{tabular}{lr}
+\toprule
+\textbf{指标} & \textbf{TFNE-C} \\
+\midrule
+总收益率 $R_{\mathrm{tot}}$     & \textbf{43.5\%} \\
+复利年化 CAGR  & \textbf{39.6\%} \\
+算术年化收益   & \textbf{37.8\%} \\
+年化波动率     & 29.6\% \\
+夏普比率       & \textbf{1.28} \\
+最大回撤 MDD   & -27.5\% \\
+期末净值       & 143.5 万元 \\
+相对沪深300超额总收益 & \textbf{15.0\%} \\
+信息比率 IR    & \textbf{0.74} \\
+年化 Alpha     & \textbf{9.0\%} \\
+Beta           & 1.33 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{（1）净值路径与最大回撤}
+
+\begin{itemize}[leftmargin=2em]
+  \item 期初（2025-04-01）净值 100.01 万元；
+  \item \textbf{最大回撤} MDD $\mathbf{-27.5\%}$（273 日样本），主要受 2025-04 系统性下跌驱动；
+  \item 期末（2026-05-20）净值 143.5 万元，总收益 43.5\%。
+\end{itemize}
+
+\textbf{单日极端：} 最大单日跌幅 2025-04-07，日收益 \textbf{-12.15\%}（全市场系统性下跌，持仓 85--97 只，beta 暴露大）。这解释了验证集前 4 个月净值承压。
+
+\paragraph{（2）分月收益——与 IC 时变相互印证}
+
+\begin{table}[H]
+\centering
+\caption{验证集分月组合收益率（由 \texttt{equity\_curve.csv} 计算）}
+\label{tab:monthly}
+\small
+\begin{tabular}{lrr|lrr}
+\toprule
+\textbf{月份} & \textbf{月收益} & \textbf{解读} & \textbf{月份} & \textbf{月收益} & \textbf{解读} \\
+\midrule
+2025-04 & $-17.22\%$ & 关税冲击，IC 波动大 & 2025-11 & $-6.80\%$ & 调整 \\
+2025-05 & $-4.68\%$ & 延续弱势 & 2025-12 & $+9.52\%$ & 反弹 \\
+2025-06 & $+4.34\%$ & 触底回升 & 2026-01 & $+15.28\%$ & 强势 \\
+2025-07 & $+8.00\%$ & 修复 & 2026-02 & $-2.75\%$ & \\
+2025-08 & $+16.87\%$ & 最佳月之一 & 2026-03 & $-9.66\%$ & 回调 \\
+2025-09 & $+0.05\%$ & 横盘 & 2026-04 & $+10.11\%$ & \\
+2025-10 & $-0.81\%$ & & 2026-05 & $+19.40\%$ & 数据末强势 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{分析：} 2025-04/05 两月累计亏损约 21\%，与 MDD 谷底一致；2025-08、2026-01、2026-05 等高 IC 月份组合收益也较高，说明\textbf{排序 alpha 在部分 regime 下可转化为 PnL}，但并非每月稳定（2025-09 几乎零收益）。273 日样本下 CAGR 36.6\% 高于 A 同窗 29.4\%——两档已对齐验证时段，可比较总收益与 Sharpe，但仍需考虑股票池与 \texttt{n\_max} 差异。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{fig1_valid_equity.png}
+\caption{验证集净值曲线（2025-04 起，273 个交易日）}
+\label{fig:eq-valid}
+\end{figure}
+
+\paragraph{（3）为何 IC 高但 Sharpe 低于档位 A？}
+
+档位 A 同验证窗 Sharpe 1.53 $>$ 本实验 1.28，但总收益 A 为 32.2\%（273 日）$<$ C 为 43.5\%（273 日）。原因包括：
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{股票池与持仓}：A 为 Top500、\texttt{n\_max=30}；C 为 Top3000、\texttt{n\_max=50}，波动与 MDD 结构不同；
+  \item \textbf{行情暴露}：C 含 2025-04 暴跌，MDD -27.5\% 远深于 A 的 -9.2\%；A 窄池在部分月份 Sharpe 更优；
+  \item \textbf{持仓更分散}：\texttt{n\_max=50} vs 30，单票 alpha 对组合拉动被稀释；
+  \item \textbf{股票池更大}：Top3000 尾部票噪声多，spread 虽高但扣费后组合收益折损更大。
+\end{enumerate}
+结论：本实验\textbf{排序层明显优于 A}，\textbf{组合层互有胜负}，报告应同时呈现 IC 与分段回测。
+
+\subsection{融合权重与模态贡献}
+
+\begin{table}[H]
+\centering
+\caption{验证集 ICIR 融合权重（\texttt{fusion\_weights.json}）}
+\label{tab:fusion}
+\begin{tabular}{llrr}
+\toprule
+\textbf{代号} & \textbf{模型} & \textbf{权重} & \textbf{单模态 best IC（seed 内）} \\
+\midrule
+A & TFT-lite   & 35.30\% & 0.016--0.066 \\
+B & FT-Transformer & 38.12\% & 0.061--0.067 \\
+C & NewsLoRA   & 26.58\% & 0.037--0.045 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+权重与单模态 IC 排序\textbf{大体一致}（FTT $>$ News $>$ TFT），但 TFT 权重（35.3\%）高于其单点 IC 暗示值——因 ICIR 定权看的是\textbf{IC 时间序列的均值/波动比}，TFT 在部分趋势月份 IC 尖峰高，抬升 ICIR。对比 A：新闻从 0.7\% $\to$ 26.6\% 是\textbf{最显著的架构红利}。
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.46\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{fig3_fusion_weights.png}
+  \caption{三模态 ICIR 融合权重}
+  \label{fig:fusion}
+\end{minipage}\hfill
+\begin{minipage}{0.52\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{fig4_latest_orders.png}
+  \caption{最新调仓 Top15 目标权重（2026-05-20）}
+  \label{fig:orders}
+\end{minipage}
+\end{figure}
+
+最新调仓 Top 权重：002594.SZ（5.01\%）、301419.SZ（4.27\%）、301360.SZ（3.94\%）等，以制造业、券商、新能源为主——与 2026-05 末高 score 板块一致，可作为模拟赛下单参考。
+
+\subsection{相对档位 A 基线的综合对比}
+
+\begin{table}[H]
+\centering
+\caption{档位 A 基线 vs 档位 C2（\textbf{同验证窗}；含策略对齐与相对大盘指标）}
+\label{tab:cmp-a}
+\begin{tabular}{lcc}
+\toprule
+\textbf{指标} & \textbf{档位 A（RGNE-Lite）} & \textbf{档位 C2（TFNE-C）} \\
+\midrule
+验证时段 & 2025-04 --- 2026-05（273 日） & 2025-04 --- 2026-05（273 日） \\
+股票池 / $K$ & Top 500 / $K$=30 & Top 3000 / $K$=50 \\
+\midrule
+全市场 mean IC & 0.016 & \textbf{0.077} \\
+ICIR & 0.102 & \textbf{0.794} \\
+Top 10\% 内 IC & 0.013 & \textbf{0.014} \\
+多空 spread（日） & $-0.116\%$ & \textbf{0.314\%} \\
+IC@K & \textbf{0.0303} & $-0.0037$ \\
+Top-$K$ 命中率 & 47.0\% & 50.1\% \\
+Top-$K$ 内 spread（日） & 0.040\% & \textbf{0.086\%} \\
+\midrule
+验证集总收益 & 32.2\% & \textbf{43.5\%} \\
+验证集 CAGR & 29.4\% & \textbf{39.6\%} \\
+验证集 Sharpe & \textbf{1.53} & 1.28 \\
+最大回撤 MDD & \textbf{-9.2\%} & $-27.5\%$ \\
+超额总收益（vs 沪深300） & 5.9\% & \textbf{15.0\%} \\
+信息比率 IR & 0.67 & \textbf{0.74} \\
+年化 Alpha / Beta & 5.4\% / 1.01 & \textbf{9.0\%} / 1.33 \\
+\midrule
+融合：时序权重 & 53.8\%（GRU） & 35.3\%（TFT） \\
+融合：截面权重 & 34.1\%（MLP） & 38.1\%（FTT） \\
+融合：新闻权重 & 12.1\%（Hash） & \textbf{26.6\%}（LoRA） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{综合结论：}
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{预测层：} Transformer 升级 + Top3000 + 三 seed 使 IC/ICIR 大幅提升，是本次实验最坚实的改进；
+  \item \textbf{新闻层：} LoRA 微调使新闻从「几乎无效」变为「近三分之一权重」，验证多模态设计的必要性；
+  \item \textbf{组合层：} 同验证窗上 C2 总收益 43.5\%、超额 IR 0.74 优于 A，但 MDD $-27.5\%$ 与 $\beta=1.33$ 提示需控制市场暴露；A Sharpe 1.53 更高源于窄池与低 beta；
+  \item \textbf{策略对齐层：} A 验证 IC@K（0.0303）优于 C2（$-$0.0037），C2 的 Top-$K$ 内 spread（21.8\%）更厚；A 的 signal\_ann 与回测背离，组合结论以回测为准；
+  \item \textbf{与 A 的关系：} A 证明了流水线可复现；C 在相同策略框架下替换模型与规模，\textbf{主要改善排序指标}，组合表现需结合市场环境解读。
+\end{enumerate}
+
+\subsection{IC 与组合收益的关系（本实验数据）}
+
+与档位 A 基线报告类似，本实验亦存在「IC 0.077 不算极高，但 273 日总收益 40\%」的现象：
+\begin{itemize}[leftmargin=2em]
+  \item IC 衡量 Top3000 \textbf{全体}排序；策略只用 Top 10\%（$\approx$300 只）且最多持 50 只；
+  \item spread 年化 79\% 是未扣费多空参考，实际组合 40\% 总收益低于 spread 上限，符合成本与只做多约束；
+  \item 2025-04 极端下跌日 -12\% 说明\textbf{排序再好也无法完全免疫系统性风险}，Sharpe 1.28 已部分反映该风险。
+\end{itemize}
+
+%==============================================================================
+\section{更新数据与最新策略预测}
+\label{sec:predict-update}
+%==============================================================================
+
+训练完成后，模拟赛与日常调仓均\textbf{不再重训}，固定使用 \texttt{config.server\_c2\_72h.yaml} 与 \texttt{tier\_c2} checkpoint。
+
+\subsection{流水线总览}
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.92\textwidth}{\centering
+\vspace{0.6em}
+\textbf{../data/*.csv}（追加最新行情与新闻）\\[0.3em]
+$\downarrow$ \texttt{01\_build\_panel} $\to$ \texttt{02\_make\_features} $\to$ \texttt{02b\_embed\_news}（CPU）\\[0.3em]
+$\downarrow$ \texttt{04\_ensemble\_predict}（GPU：TFT/FTT/News checkpoint 推理 + 秩融合）\\[0.3em]
+$\downarrow$ \texttt{07\_predict\_latest}（读融合 score $\to$ \texttt{orders\_YYYYMMDD.csv}）\\[0.6em]
+}}
+\caption{更新数据后的预测与调仓流水线（不重训）}
+\label{fig:predict-pipe}
+\end{figure}
+
+\subsection{本机命令（Windows PowerShell）}
+
+\paragraph{（1）数据未变，仅刷新调仓}
+
+\begin{verbatim}
+conda activate ai25
+cd code
+python scripts/07_predict_latest.py --config config.server_c2_72h.yaml
+\end{verbatim}
+
+\paragraph{（2）CSV 有新日期，扩展融合 score}
+
+\begin{verbatim}
+conda activate ai25
+cd code
+python scripts/01_build_panel.py --config config.server_c2_72h.yaml
+python scripts/02_make_features.py --config config.server_c2_72h.yaml
+python scripts/02b_embed_news.py --config config.server_c2_72h.yaml
+python scripts/04_ensemble_predict.py --config config.server_c2_72h.yaml
+python scripts/07_predict_latest.py --config config.server_c2_72h.yaml
+\end{verbatim}
+
+\texttt{04} 已支持 News checkpoint 自动推理，通常无需重训 News 模态。
+
+\subsection{注意事项}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{配置不可混用}：勿用档位 A 的 \texttt{config.tier\_a\_local.yaml} 或 \texttt{tier\_a} checkpoint 加载本实验权重；
+  \item \textbf{融合权重}：默认读 \texttt{fusion\_weights.json}，删除该文件才会在 valid 段重估 ICIR 权重；
+  \item \textbf{换股票池或改 $L$}：需重新 prep + 全量训练。
+\end{itemize}
+
+%==============================================================================
+\section{规范性与可复现性}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\caption{复现命令（服务器训练 + 本机增量预测）}
+\label{tab:repro}
+\begin{tabular}{p{11cm}}
+\toprule
+\textbf{步骤} \\
+\midrule
+工作目录：\texttt{/home/scc/pb23151824/pro/code} \\
+\texttt{python scripts/run\_server\_c2\_72h.py prep} \\
+\texttt{python scripts/run\_server\_c2\_72h.py train \&\& ... eval} \\
+配置固定为 \texttt{config.server\_c2\_72h.yaml} \\
+\midrule
+\textbf{本机出图}：\texttt{conda activate ai25}；\\
+\texttt{python tier\_c2\_project/scripts/plot\_tier\_c2\_report.py} \\
+\textbf{本机预测}：见第~\ref{sec:predict-update} 节 \\
+\midrule
+\textbf{档位 A 基线复现}：见 \texttt{基线报告.tex}；\\
+\texttt{python scripts/run\_tier\_a\_local.py} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{itemize}[leftmargin=2em]
+  \item 作业日志：\texttt{logs/train\_7945.out}；完成标志 \texttt{[CHECK] train+eval OK}；
+  \item RoBERTa 加载时 \texttt{cls.predictions.*} 显示 \texttt{UNEXPECTED} 为正常现象。
+\end{itemize}
+
+%==============================================================================
+\section{总结与反思}
+%==============================================================================
+
+\subsection{主要结论}
+
+\begin{enumerate}[leftmargin=2em]
+  \item TFNE-C 在 RTX 5090 上约 39 小时完成 Top3000 × 3 seed 全流水线，工程可行；
+  \item 相对同口径档位 A 基线，FT-Transformer 与 NewsLoRA 显著抬升融合 IC（0.016 $\to$ 0.077）与 ICIR（0.102 $\to$ 0.794）；
+  \item 新闻模态从近零权重升至 26.6\%，验证 RoBERTa 微调优于哈希新闻编码；
+  \item 验证集 273 日回测总收益 43.5\%、Sharpe 1.28，组合层具备一定实战价值，但 MDD -27.5\% 仍需关注；
+  \item 回测引擎已纳入\textbf{部分} A 股现实约束（见下节），但仍有简化假设，模拟赛结果可用于进一步校验；
+  \item 赛前 holdout 切分更贴近模拟赛，FDL2026 实战表现待赛后补充。
+\end{enumerate}
+
+\subsection{回测现实约束：已考虑什么、还缺什么}
+
+作业与档位 A 均强调：历史回测应尽可能贴近真实交易。对照 \texttt{src/backtest.py} 与 \texttt{src/strategy.py}，对本实验回测逐项自检如下。
+
+\begin{table}[H]
+\centering
+\caption{回测现实约束自检（\texttt{backtest.py} / \texttt{strategy.py}）}
+\label{tab:bt-realism}
+\small
+\begin{tabular}{p{2.6cm}cp{4.2cm}p{4.5cm}}
+\toprule
+\textbf{约束} & \textbf{状态} & \textbf{本实验实现方式} & \textbf{说明} \\
+\midrule
+手续费 & \checkmark & 买卖均扣佣金 $0.015\%$（\texttt{commission=0.00015}） & 每笔成交按金额比例扣费 \\
+印花税 & \checkmark & 仅卖出扣 $0.05\%$（\texttt{stamp\_tax=0.0005}） & 符合 A 股卖出单边征收 \\
+滑点 & \checkmark & 买卖均扣 $0.05\%$（\texttt{slippage=0.0005}） & 固定比例，未区分买卖方向 \\
+最小交易单位 & \checkmark & 100 股整手：$\lfloor|\Delta V|/(100P)\rfloor\times 100$ & 零股丢弃，可能留现金碎片 \\
+T+1 可卖 & \checkmark & 当日买入 \texttt{sellable=False}，次日才可卖 & 符合 A 股 T+1 \\
+T+1 成交时点 & \checkmark & $t$ 日信号，$t\!+\!1$ 日\textbf{开盘价}成交 & 避免用 $t$ 日收盘价即时成交的泄露 \\
+涨停不买 & \checkmark & $t\!+\!1$ 日 \texttt{pct\_chg}$\ge 9.5\%$ 跳过买入 & 简化阈值，未区分 10\%/20\% 板 \\
+停牌/无量 & \checkmark & \texttt{tradable\_universe} 要求 \texttt{vol}$>0$ & 成交量为 0 则不进入可买池 \\
+ST / 北交所 & \checkmark & 候选池剔除 \texttt{is\_st}、.BJ & 与 prep 规则一致 \\
+流动性门槛 & \checkmark & 20 日平均成交额 $\ge 5000$ 万 & 与面板构建一致 \\
+\midrule
+跌停不卖 & $\times$ & 未实现 & 跌停日仍可按开盘价卖出，可能\textbf{高估}可执行性 \\
+分板块涨跌幅 & $\times$ & 统一 9.5\% 阈值 & 科创/创业 20\%、ST 5\% 未区分 \\
+成交量容量 & $\times$ & 未限制单笔占当日成交量比例 & 大单可「无限」按开盘价成交 \\
+最低佣金 & $\times$ & 无「每笔最低 5 元」规则 & 小单成本可能被低估 \\
+冲击成本 & $\times$ & 仅固定滑点 & 未随订单规模动态放大 \\
+软换仓滞后 & 部分 & \texttt{delta}/\texttt{omega\_max} & 非规则缺失，但导致持仓数远超 \texttt{n\_max} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{总体判断：} 本实验回测\textbf{已经考虑}手续费、印花税、滑点、100 股整手、T+1、涨停不买、停牌（无量）过滤等核心约束，并非「理想化零成本回测」。报告中的 Sharpe 1.28、总收益 43.5\% 是在\textbf{扣费后}净值上计算的。但仍存在若干简化，尤其\textbf{跌停卖出}与\textbf{流动性容量}未建模，极端行情下回测收益可能略偏乐观。
+
+\subsection{若进一步加入缺失约束：如何做、有何意义}
+
+\paragraph{（1）跌停/一字板：卖出失败}
+
+\textbf{现状：} 仅限制「涨停不买」，未限制「跌停不卖」。2025-04-07 类暴跌日中，若持仓大面积跌停，实盘往往无法按目标价卖出，回测却仍可卖出。
+
+\textbf{建议实现：} 在 \texttt{rebalance\_day} 卖出分支增加：若 \texttt{pct\_chg}$\le -9.5\%$（或结合 \texttt{open==high} 判断一字跌停），则 \texttt{shares\_sell=0}；科创/创业板可用 $\pm 19.5\%$、ST 用 $\pm 4.5\%$。
+
+\textbf{意义：} 更真实反映尾部风险，MDD 与 Sharpe 可能进一步下降，但\textbf{避免回测过度美化}——对评估 2025-04 单月 -17\% 类情景尤为重要。
+
+\paragraph{（2）分板块涨跌停阈值}
+
+\textbf{现状：} 主板、科创、创业、ST 统一用 9.5\% 过滤买入。
+
+\textbf{建议实现：} 根据 \texttt{ts\_code} 前缀或 \texttt{basic} 中板块字段选择阈值（10\% / 20\% / 5\%）。
+
+\textbf{意义：} Top3000 含大量创业板/科创板，统一 9.5\% 会误判部分「未封板但涨幅较大」的可买标的，或漏判 20\% 板涨停。
+
+\paragraph{（3）成交量/成交额容量约束}
+
+\textbf{现状：} 假设任意规模订单均可按开盘价完全成交。
+
+\textbf{建议实现：} 单笔买入不超过当日成交量（或成交额）的 $\alpha$（如 1\%--5\%），超出部分顺延至后续交易日；或采用 VWAP 近似。
+
+\textbf{意义：} 本策略 \texttt{n\_max=50}、单票上限 5\%，对中小票通常可成交；但若 scale 到更大资金或更小流动性股票，\textbf{容量约束}会显著压低可执行 alpha——加入后可检验策略资金容量。
+
+\paragraph{（4）最低佣金与过户费}
+
+\textbf{现状：} 纯比例费率，无单笔下限。
+
+\textbf{建议实现：} $\text{fee}=\max(\text{amount}\times rate,\ 5\text{元})$；必要时加过户费（现行极低，可忽略）。
+
+\textbf{意义：} 对小市值、小偏离调仓（\texttt{delta=1\%} 边缘单）成本更真实，长期换手略降、净值略低。
+
+\paragraph{（5）动态滑点 / 冲击成本}
+
+\textbf{现状：} 固定 0.05\% 滑点，与订单大小无关。
+
+\textbf{建议实现：} $\mathrm{slip}=\mathrm{slip}_0+\kappa\cdot(\mathrm{order\_vol}/\mathrm{ADV})$，其中 ADV 为平均日成交额。
+
+\textbf{意义：} 反映「大单推价」效应；对验证 Top3000 宽基策略在大资金下的可扩展性有意义。
+
+\paragraph{（6）完善软换仓与目标持仓对齐}
+
+\textbf{现状：} \texttt{omega\_max=25\%} 使旧仓无法快速清掉，\texttt{n\_hold} 可升至 200+，偏离 \texttt{n\_max=50} 的设计意图。
+
+\textbf{建议实现：} 对「不在目标 Top50 且权重应为 0」的 legacy 持仓设\textbf{强制减仓通道}（不受 \texttt{delta} 限制、或单独更高卖出行配额）；或降低 \texttt{omega\_max} 做敏感性分析。
+
+\textbf{意义：} 使回测持仓结构与 \texttt{orders\_*.csv} 输出一致，组合收益更贴近「50 只核心组合」而非「累积杂仓」。
+
+\subsection{现实约束对报告结论的影响（定性）}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{已扣费}：43.5\% 总收益已含佣金/印花税/滑点，不是 gross spread 的 79\% 年化；
+  \item \textbf{涨停/停牌}：减少「买不到」的乐观假设，2025 年部分反弹日可能略低估收益；
+  \item \textbf{未建模跌停卖不出}：2025-04--06 回撤段可能\textbf{略低估}实盘困难，真实 MDD 或略大于 -27.5\%；
+  \item \textbf{无容量限制}：100 万本金下影响有限；若放大到数千万，应优先加容量与冲击成本；
+  \item \textbf{模拟赛}：同花顺平台另有委托排队、部分成交等规则，应以实战截图与回测\textbf{交叉验证}。
+\end{itemize}
+
+\subsection{局限与后续工作}
+
+\begin{itemize}[leftmargin=2em]
+  \item 与档位 A 已对齐验证时段；股票池、持仓参数仍不同，对比需分段表述；
+  \item 不设独立 test 段；样本外检验依赖 FDL2026 模拟赛（2026-06-01 至 06-10），该段\textbf{不写入} IC/回测表；
+  \item 回测可加强：跌停不卖、分板块涨跌幅、成交量容量、最低佣金（见表~\ref{tab:bt-realism}）；
+  \item \texttt{news\_max\_length} 为 128；04 全量推理约 8 h，增量 predict 可优化；
+  \item TFT 单 seed 间 IC 方差仍较大，可探索更长训练或架构改进。
+\end{itemize}
+
+\section*{参考文献}
+\addcontentsline{toc}{section}{参考文献}
+\begin{enumerate}[leftmargin=2em]
+  \item Gu, S., Kelly, B., \& Xiu, D. (2020). Empirical Asset Pricing via Machine Learning. \textit{Review of Financial Studies}.
+  \item Gorishniy, Y., et al. (2021). Revisiting Deep Learning Models for Tabular Data. \textit{NeurIPS} (FT-Transformer).
+  \item Lim, B., et al. (2021). Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting.
+  \item Hu, E. J., et al. (2021). LoRA: Low-Rank Adaptation of Large Language Models.
+\end{enumerate}
+
+\section{主要产物路径}
+\addcontentsline{toc}{section}{主要产物路径}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{内容} & \textbf{路径} \\
+\midrule
+本实验配置 & \texttt{code/config.server\_c2\_72h.yaml} \\
+IC 汇总 & \texttt{code/artifacts/metrics/tier\_c2/ic\_summary.json} \\
+融合权重 & \texttt{code/artifacts/predictions/tier\_c2/fusion\_weights.json} \\
+融合 score & \texttt{code/artifacts/predictions/tier\_c2/ensemble\_scores.parquet} \\
+回测指标 & \texttt{code/artifacts/backtest/tier\_c2/valid/metrics.json} \\
+净值曲线 & \texttt{code/artifacts/backtest/tier\_c2/valid/equity\_curve.csv} \\
+最新订单 & \texttt{code/artifacts/orders/tier\_c2/orders\_20260520.csv} \\
+模型 checkpoint & \texttt{code/artifacts/checkpoints/tier\_c2/\{tft,ftt,news\}/seed\_*/best.pt} \\
+报告图表 & \texttt{tier\_c2\_project/figures/fig*.png} \\
+档位 A 基线报告 & \texttt{基线报告.tex} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

@@ -1,0 +1,4 @@
+# 新闻模态可选依赖（use_news_bert: true 时需要）
+transformers>=4.36.0
+peft>=0.10.0
+sentencepiece>=0.1.99

@@ -1,0 +1,57 @@
+# --- 大体积数据（约 4GB+，请用网盘/服务器单独备份）---
+data/daily/
+data/metric/
+data/moneyflow/
+data/news/
+data/stock_st/
+data/index_weight/
+
+# --- 训练产物（约 5GB+，checkpoint 在服务器重建）---
+code/artifacts/
+
+# --- 打包归档 ---
+*.tar.gz
+*.zip
+code.tar.gz
+data.tar.gz
+
+# --- 模型与中间表 ---
+*.pt
+*.parquet
+*.pth
+*.ckpt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- LaTeX 编译产物 ---
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.bbl
+*.blg
+
+# --- Slurm / 日志 ---
+*.err
+train_c2_*.out
+prep_c2_*.out
+code/logs/
+
+# --- 临时恢复片段 ---
+_restore_*.txt
+*SFConflict*
+
+# --- IDE / 系统 ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
